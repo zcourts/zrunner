@@ -4,6 +4,7 @@ After=default.target
 
 [Service]
 Type=simple
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/.local/bin/zrunner daemon --config %h/.config/zrunner/config.json
 Restart=always
 RestartSec=2
