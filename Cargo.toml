@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/zrunner",
+    "crates/zrunner-core",
+    "crates/zrunner-protocol",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/zcourts/zrunner"
+
+[workspace.dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ulid = { version = "1.2", features = ["serde"] }
+zrunner-core = { path = "crates/zrunner-core" }
+zrunner-protocol = { path = "crates/zrunner-protocol" }

@@ -1,0 +1,19 @@
+[Unit]
+Description=Zrunner shared build scheduler
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/zrunner daemon --config %h/.config/zrunner/config.json
+Restart=always
+RestartSec=2
+KillMode=control-group
+CPUQuota=600%
+MemoryHigh=10G
+MemoryMax=12G
+TasksMax=512
+IOWeight=50
+Nice=5
+
+[Install]
+WantedBy=default.target

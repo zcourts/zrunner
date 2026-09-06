@@ -1,0 +1,14 @@
+{
+  "aiboard": "/home/zcourts/projects/projects/releases/aiboard/0.3.0/linux-aarch64/aiboard",
+  "board_root": "/home/zcourts/projects/projects/.ai/message-board",
+  "runner": "debian1",
+  "limits": {
+    "max_running_jobs": 2,
+    "max_compile_slots": 6,
+    "host_memory_reserve_mib": 4096,
+    "max_job_memory_mib": 12288,
+    "cpu_pressure_limit": 25.0,
+    "memory_pressure_limit": 2.0,
+    "io_pressure_limit": 8.0
+  }
+}
