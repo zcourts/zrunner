@@ -8,3 +8,7 @@ returns buffered stdout and stderr to a job-specific AI Board group.
 The first implementation targets Linux and is supervised by `systemd --user`.
 See [the design](docs/design.md) for the protocol, resource model, and rollout
 sequence.
+
+Docker-build jobs deliberately remain disabled until a runner-owned bounded
+BuildKit worker is installed; Rust and generic noninteractive jobs are the
+initial supported profiles.

@@ -1,6 +1,6 @@
 # Zrunner build scheduler
 
-Status: approved design, implementation in progress
+Status: initial Linux implementation
 Date: 2026-09-06
 
 ## Purpose
@@ -52,9 +52,10 @@ by expiry minute so ten-minute garbage collection never scans the whole board.
 Zrunner output expires; lifecycle summaries do not.
 
 Migration copies every valid v1 document to deterministic v2 routes, validates
-the copy, and leaves v1 untouched. New clients dual-read during a compatibility
-window. Since v1 has no durable delivery cursor, first v2 startup replays a
-bounded recent window and may duplicate messages rather than silently lose one.
+the copy, and leaves v1 untouched. The coordinated cutover stops v1 writers,
+runs the idempotent migration, and then starts v2 clients. Since v1 has no
+durable delivery cursor, first v2 startup establishes its checkpoint without
+replaying the complete historical board; history remains explicitly available.
 
 ## Job protocol
 
@@ -91,10 +92,12 @@ jobs are never preempted. Suggested priorities are 100 for a direct user
 emergency, 50 for an active release blocker, 0 for normal work, and -50 for
 background qualification.
 
-Lifecycle states are submitted, accepted, queued, started, interrupted,
-completed, failed, and cancelled. Durable events let the runner reconstruct its
-queue after restart. A started job left by a runner failure is interrupted and
-retried only within its explicit retry allowance. Execution is at-least-once.
+Lifecycle states are accepted, queued, started, completed, failed, cancelled,
+and rejected. Durable events are written to the `zrunner` group so the runner
+can reconstruct queued and terminal work after restart. Execution is
+at-least-once: nonterminal jobs are replayed after runner restart and therefore
+must be safe to repeat. Bounded retry accounting is a later capability despite
+the reserved `retry_on_runner_restart` field.
 
 ## Scheduling and enforcement
 
@@ -103,8 +106,8 @@ head job runs only when its locks and declared resource reservation fit. A job
 that can never fit configured hard limits is rejected rather than blocking the
 queue indefinitely.
 
-Before admission, Linux samples `/proc/stat`, `/proc/meminfo`, and CPU, memory,
-and I/O PSI for five seconds. It accounts for running reservations and stops
+Before admission, Linux reads `/proc/meminfo` plus the kernel's ten-second CPU,
+memory, and I/O PSI averages. It accounts for running reservations and stops
 admitting jobs when the host reserve or pressure thresholds would be violated.
 Transient pressure never kills an existing job.
 
@@ -118,7 +121,7 @@ runner_memory_high_mib = 10240
 runner_memory_max_mib = 12288
 cpu_quota_percent = 600
 tasks_max = 512
-admission_sample_seconds = 5
+admission_interval_seconds = 5
 ```
 
 Rust jobs receive an allocation from the six-slot aggregate pool through
@@ -126,9 +129,10 @@ Rust jobs receive an allocation from the six-slot aggregate pool through
 locks prevent separate Cargo processes from contending for the same configured
 target directory.
 
-Docker builds use a runner-owned Buildx/BuildKit builder with its own CPU,
-memory, and parallelism limits. Restricting only the Docker CLI process would
-not constrain containers created by the Docker daemon.
+Docker-build jobs are rejected in the initial rollout. They will be enabled
+only after a runner-owned Buildx/BuildKit builder has its own CPU, memory, and
+parallelism limits; restricting only the Docker CLI process would not constrain
+containers created by the Docker daemon.
 
 ## Output
 
@@ -136,8 +140,7 @@ The runner reads stdout and stderr independently. It flushes a stream when it
 reaches 256 KiB, after two seconds, when output becomes quiet, or when the child
 exits. Each event records job ID, sequence, stream, encoding, data, and time.
 Invalid UTF-8 is Base64 encoded. The final durable event records the last
-sequence, exit status or signal, duration, CPU use, peak memory, I/O totals, and
-the observed source revision. Consumers can detect and retrieve a missing
+sequence, exit status, and duration. Consumers can detect a missing output
 sequence before its expiry.
 
 ## Supervision and recovery
@@ -145,8 +148,9 @@ sequence before its expiry.
 Linux runs `zrunner daemon` as a user service with `Restart=always`,
 `KillMode=control-group`, `MemoryHigh`, `MemoryMax`, `CPUQuota`, `TasksMax`, and
 an appropriate I/O weight. One host-local lock prevents duplicate daemons. On
-restart, zrunner requests durable `zrunner` history, rebuilds the latest state
-per job, marks abandoned running work interrupted, and resumes dispatch.
+restart, zrunner requests durable `zrunner` history, rebuilds queued and
+terminal state, and resumes dispatch. A previously started nonterminal job is
+replayed, which is why submitted commands must tolerate at-least-once execution.
 
 The daemon itself remains small. Build subprocesses are its direct descendants,
 so systemd removes them if ownership is lost. Cancellation sends SIGTERM to the

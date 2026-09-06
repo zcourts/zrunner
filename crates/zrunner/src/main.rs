@@ -25,6 +25,7 @@ use zrunner_protocol::{
 const DEFAULT_ROOT: &str = "/home/zcourts/projects/projects/.ai/message-board";
 const FLUSH_BYTES: usize = 256 * 1024;
 const FLUSH_AFTER: Duration = Duration::from_secs(2);
+const TERMINATION_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -128,7 +129,12 @@ struct RunningJob {
     stdout: OutputBuffer,
     stderr: OutputBuffer,
     streams_open: usize,
-    termination_sent: bool,
+    termination: Option<Termination>,
+}
+
+struct Termination {
+    sent_at: Instant,
+    state: JobState,
 }
 
 fn main() {
@@ -368,9 +374,37 @@ impl Daemon {
         };
         match value.get("schema").and_then(Value::as_str) {
             Some(JOB_SCHEMA) => {
-                let job: Job = serde_json::from_value(value)?;
+                let job: Job = match serde_json::from_value(value) {
+                    Ok(job) => job,
+                    Err(error) => {
+                        eprintln!("zrunner: reject malformed job: {error}");
+                        return Ok(());
+                    }
+                };
                 if job.runner == self.config.runner && !self.terminal.contains(&job.id) {
-                    let inserted = self.scheduler.enqueue(job.clone())?;
+                    if matches!(job.profile, JobProfile::DockerBuild) {
+                        self.publish_state(
+                            &job,
+                            JobState::Rejected,
+                            Some("docker-build jobs are disabled until the bounded runner-owned BuildKit builder is installed"),
+                            None,
+                        )?;
+                        self.terminal.insert(job.id);
+                        return Ok(());
+                    }
+                    let inserted = match self.scheduler.enqueue(job.clone()) {
+                        Ok(inserted) => inserted,
+                        Err(error) => {
+                            self.publish_state(
+                                &job,
+                                JobState::Rejected,
+                                Some(&format!("invalid job: {error:#}")),
+                                None,
+                            )?;
+                            self.terminal.insert(job.id);
+                            return Ok(());
+                        }
+                    };
                     if inserted {
                         self.board_command(json!({"op":"group.join","name":job.group}))?;
                         self.publish_state(&job, JobState::Accepted, None, None)?;
@@ -392,6 +426,11 @@ impl Daemon {
                             )?;
                         } else if let Some(running) = self.running.get(&control.job) {
                             signal_group(running.child.id(), libc::SIGTERM)?;
+                            let running = self.running.get_mut(&control.job).expect("running job");
+                            running.termination = Some(Termination {
+                                sent_at: Instant::now(),
+                                state: JobState::Cancelled,
+                            });
                         }
                     }
                     ControlAction::SetPriority { priority } => {
@@ -451,7 +490,7 @@ impl Daemon {
                 stdout: OutputBuffer::default(),
                 stderr: OutputBuffer::default(),
                 streams_open: 2,
-                termination_sent: false,
+                termination: None,
             },
         );
         Ok(())
@@ -465,10 +504,23 @@ impl Daemon {
             });
             if timed_out {
                 let running = self.running.get_mut(&id).expect("running job");
-                if !running.termination_sent {
+                if running.termination.is_none() {
                     signal_group(running.child.id(), libc::SIGTERM)?;
-                    running.termination_sent = true;
+                    running.termination = Some(Termination {
+                        sent_at: Instant::now(),
+                        state: JobState::Failed,
+                    });
                 }
+            }
+            let force_kill = self.running.get(&id).is_some_and(|running| {
+                running
+                    .termination
+                    .as_ref()
+                    .is_some_and(|termination| termination.sent_at.elapsed() >= TERMINATION_GRACE)
+            });
+            if force_kill {
+                let running = self.running.get(&id).expect("running job");
+                signal_group(running.child.id(), libc::SIGKILL)?;
             }
             let status = self
                 .running
@@ -482,11 +534,16 @@ impl Daemon {
                 let running = self.running.remove(&id).expect("running job");
                 self.scheduler.finish(id);
                 self.terminal.insert(id);
-                let state = if timed_out || !status.success() {
-                    JobState::Failed
-                } else {
-                    JobState::Completed
-                };
+                let state = running.termination.as_ref().map_or_else(
+                    || {
+                        if status.success() {
+                            JobState::Completed
+                        } else {
+                            JobState::Failed
+                        }
+                    },
+                    |termination| termination.state,
+                );
                 let detail = format!("elapsed_ms={}", running.started.elapsed().as_millis());
                 self.publish_state(&running.job, state, Some(&detail), status.code())?;
             }
@@ -572,7 +629,7 @@ impl Daemon {
         };
         self.board_command(json!({
             "op":"send",
-            "group":job.group,
+            "group":"zrunner",
             "message":serde_json::to_string(&event)?
         }))
     }
@@ -639,6 +696,11 @@ fn signal_group(pid: u32, signal: i32) -> Result<()> {
     if result == 0 {
         Ok(())
     } else {
-        Err(anyhow!(std::io::Error::last_os_error())).context("signal job process group")
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(anyhow!(error)).context("signal job process group")
+        }
     }
 }
