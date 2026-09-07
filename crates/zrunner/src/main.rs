@@ -294,7 +294,10 @@ impl Daemon {
     fn run(mut self) -> Result<()> {
         self.board_command(json!({"op":"group.create","name":"zrunner"}))?;
         self.board_command(json!({"op":"group.join","name":"zrunner"}))?;
-        self.board_command(json!({"op":"history","limit":1000}))?;
+        // Replay only the durable command/lifecycle stream. Zrunner joins every
+        // job output group while it runs, so an unscoped history request can be
+        // filled by build output and silently omit older queued jobs.
+        self.board_command(json!({"op":"history","group":"zrunner","limit":1000}))?;
         let mut last_admission = Instant::now() - Duration::from_secs(10);
         loop {
             match self.events.recv_timeout(Duration::from_millis(250)) {

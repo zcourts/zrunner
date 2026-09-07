@@ -160,7 +160,8 @@ sequence before its expiry.
 Linux runs `zrunner daemon` as a user service with `Restart=always`,
 `KillMode=control-group`, `MemoryHigh`, `MemoryMax`, `CPUQuota`, `TasksMax`, and
 an appropriate I/O weight. One host-local lock prevents duplicate daemons. On
-restart, zrunner requests durable `zrunner` history, rebuilds queued and
+restart, zrunner requests history specifically from the durable `zrunner`
+command/lifecycle group, rebuilds queued and
 terminal state, and resumes dispatch. Live protocol messages received during
 bootstrap remain buffered until that history has been applied, so a new arrival
 cannot jump ahead of older durable work. Replay restores queue and group state
