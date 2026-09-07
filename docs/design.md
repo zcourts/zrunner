@@ -76,11 +76,14 @@ with the job envelope in the Zboard message's structured `meta` field in the
     "project": "worka",
     "cwd": "/home/zcourts/projects/projects/worka/worka",
     "argv": ["cargo", "test", "--locked", "--workspace"],
-    "env": {"RUST_BACKTRACE": "1"},
+    "env": {
+      "CARGO_TARGET_DIR": "/home/zcourts/projects/projects/build/debian1/worka",
+      "RUST_BACKTRACE": "1"
+    },
     "priority": 0,
     "profile": "rust",
     "resources": {"compile_slots": "auto", "memory_mib": 4096},
-    "locks": ["cargo-target:debian1"],
+    "locks": ["cargo-target:debian1:worka"],
     "timeout_seconds": 3600,
     "retry_on_runner_restart": 1,
     "output_ttl_seconds": 86400

@@ -165,29 +165,7 @@ fn run_main() -> Result<()> {
         return Ok(());
     }
     if command == "example-job" {
-        let id = Ulid::new();
-        let job = Job {
-            schema: JOB_SCHEMA.to_owned(),
-            id,
-            runner: default_runner(),
-            group: format!("job-{}", id.to_string().to_ascii_lowercase()),
-            project: None,
-            cwd: std::env::current_dir()?.to_string_lossy().into_owned(),
-            argv: vec![
-                "cargo".to_owned(),
-                "check".to_owned(),
-                "--locked".to_owned(),
-            ],
-            env: Default::default(),
-            priority: 0,
-            profile: JobProfile::Rust,
-            resources: Default::default(),
-            locks: vec![format!("cargo-target:{}", default_runner())],
-            exclusive: None,
-            timeout_seconds: 3600,
-            retry_on_runner_restart: 1,
-            output_ttl_seconds: 86400,
-        };
+        let job = example_job(std::env::current_dir()?);
         println!("{}", serde_json::to_string_pretty(&job)?);
         return Ok(());
     }
@@ -207,6 +185,43 @@ fn run_main() -> Result<()> {
     }
     let config = load_config(config_path.as_deref())?;
     Daemon::start(config)?.run()
+}
+
+fn example_job(cwd: PathBuf) -> Job {
+    let id = Ulid::new();
+    let project = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("project");
+    let runner = default_runner();
+    Job {
+        schema: JOB_SCHEMA.to_owned(),
+        id,
+        runner: runner.clone(),
+        group: format!("job-{}", id.to_string().to_ascii_lowercase()),
+        project: None,
+        cwd: cwd.to_string_lossy().into_owned(),
+        argv: vec![
+            "cargo".to_owned(),
+            "check".to_owned(),
+            "--locked".to_owned(),
+        ],
+        env: [(
+            "CARGO_TARGET_DIR".to_owned(),
+            format!("/home/zcourts/projects/projects/build/{runner}/{project}"),
+        )]
+        .into_iter()
+        .collect(),
+        priority: 0,
+        profile: JobProfile::Rust,
+        resources: Default::default(),
+        locks: vec![format!("cargo-target:{runner}:{project}")],
+        exclusive: None,
+        timeout_seconds: 3600,
+        retry_on_runner_restart: 1,
+        output_ttl_seconds: 86400,
+    }
 }
 
 fn load_config(path: Option<&Path>) -> Result<Config> {
@@ -996,6 +1011,18 @@ mod tests {
 
     use super::*;
     use zrunner_protocol::ResourceRequest;
+
+    #[test]
+    fn example_job_uses_a_project_specific_target_and_lock() {
+        let job = example_job(PathBuf::from(
+            "/home/zcourts/projects/projects/worka/zrunner",
+        ));
+        assert_eq!(
+            job.env.get("CARGO_TARGET_DIR").map(String::as_str),
+            Some("/home/zcourts/projects/projects/build/debian1/zrunner")
+        );
+        assert_eq!(job.locks, ["cargo-target:debian1:zrunner"]);
+    }
 
     #[test]
     fn structured_meta_is_the_protocol_payload() {
