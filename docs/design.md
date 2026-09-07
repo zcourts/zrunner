@@ -111,9 +111,17 @@ the reserved `retry_on_runner_restart` field.
 ## Scheduling and enforcement
 
 The queue key is descending priority, ascending submission time, then ULID. The
-head job runs only when its locks and declared resource reservation fit. A job
-that can never fit configured hard limits is rejected rather than blocking the
-queue indefinitely.
+scheduler selects the highest-priority ordinary job whose locks and declared
+resource reservation fit, so a temporarily blocked ordinary head does not
+strand capacity. A job that can never fit configured hard limits is rejected
+rather than blocking the queue indefinitely.
+
+Host-wide exclusivity is exceptional rather than profile-implied. A job must
+include a non-empty `exclusive.reason`, its Zboard submitter project and profile
+must appear in the runner's exclusivity policy, and the accepted request remains
+in durable job history. An authorized exclusive job acts as a drain barrier at
+its priority and blocks all admission while it runs. An unauthorized request is
+rejected. Ordinary Docker builds never receive host exclusivity implicitly.
 
 Before admission, Linux reads `/proc/meminfo` plus the kernel's ten-second CPU,
 memory, and I/O PSI averages. It accounts for running reservations and stops
@@ -131,6 +139,10 @@ runner_memory_max_mib = 12288
 cpu_quota_percent = 600
 tasks_max = 512
 admission_interval_seconds = 5
+
+[exclusive]
+allowed_projects = ["infra"]
+allowed_profiles = ["docker-build"]
 ```
 
 Rust jobs receive an allocation from the six-slot aggregate pool through
@@ -141,10 +153,11 @@ target directory.
 Docker-build jobs use the runner-selected `docker-container` Buildx builder.
 That BuildKit container has its own CPU, memory, swap, and parallelism bounds;
 restricting only the Docker CLI process would not constrain containers created
-by the Docker daemon. Docker builds run exclusively with respect to other
-zrunner jobs and the runner accepts only a direct `docker buildx build` argument
-array. It rejects caller-selected `--builder` options and injects the configured
-builder through `BUILDX_BUILDER`.
+by the Docker daemon. A runner-owned named lock serializes jobs using that
+builder while unrelated jobs may run when resource admission permits. The
+runner accepts only a direct `docker buildx build` argument array, rejects
+caller-selected `--builder` options, and injects the configured builder through
+`BUILDX_BUILDER`.
 
 ## Output
 
@@ -169,9 +182,12 @@ without emitting duplicate `accepted` or `queued` events. A previously started n
 is replayed, which is why submitted commands must tolerate at-least-once
 execution.
 
-The daemon itself remains small. Build subprocesses are its direct descendants,
-so systemd removes them if ownership is lost. Cancellation sends SIGTERM to the
-job process group and SIGKILL only after a bounded grace period.
+The daemon itself remains small. Build subprocesses remain in its service
+cgroup, so systemd removes them if ownership is lost. Cancellation discovers
+and signals every process group already present below the supervised command,
+waits a bounded grace period, and then sends SIGKILL if needed. A wrapper shell
+exiting does not produce a terminal event while one of its tracked descendant
+groups is still alive.
 
 ## Rollout
 

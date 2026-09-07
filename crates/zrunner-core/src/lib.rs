@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use ulid::Ulid;
-use zrunner_protocol::{CompileSlots, Job, JobProfile};
+use zrunner_protocol::{CompileSlots, Job};
 
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -161,41 +161,50 @@ impl Scheduler {
         if self.running.len() >= limits.max_running_jobs || self.queue.is_empty() {
             return Ok(None);
         }
-        let key = self.queue.first().cloned().expect("queue is not empty");
-        let job = self.jobs.get(&key.id).expect("queue points to job");
-        let docker_is_running = self.running.keys().any(|id| {
-            self.jobs
-                .get(id)
-                .is_some_and(|job| matches!(job.profile, JobProfile::DockerBuild))
-        });
-        if (matches!(job.profile, JobProfile::DockerBuild) && !self.running.is_empty())
-            || docker_is_running
+        if self
+            .running
+            .keys()
+            .any(|id| self.jobs.get(id).is_some_and(|job| job.exclusive.is_some()))
         {
             return Ok(None);
-        }
-        let requested_memory = job.resources.memory_mib.max(512);
-        if requested_memory > limits.max_job_memory_mib {
-            bail!("job {} requests more memory than the host limit", job.id);
         }
         let used_slots: u16 = self.running.values().map(|item| item.compile_slots).sum();
         let free_slots = limits.max_compile_slots.saturating_sub(used_slots);
         if free_slots == 0 {
             return Ok(None);
         }
-        let requested_slots = match &job.resources.compile_slots {
-            CompileSlots::Exact(value) => (*value).max(1),
-            CompileSlots::Auto(_) => free_slots.clamp(1, 4),
-        };
-        if requested_slots > free_slots
-            || host.available_memory_mib
-                < requested_memory.saturating_add(limits.host_memory_reserve_mib)
-            || host.cpu_pressure_some_avg10 > limits.cpu_pressure_limit
-            || host.memory_pressure_full_avg10 > limits.memory_pressure_limit
-            || host.io_pressure_full_avg10 > limits.io_pressure_limit
-            || job.locks.iter().any(|lock| self.locks.contains(lock))
-        {
-            return Ok(None);
+        let mut selected = None;
+        for key in &self.queue {
+            let job = self.jobs.get(&key.id).expect("queue points to job");
+            let requested_memory = job.resources.memory_mib.max(512);
+            if requested_memory > limits.max_job_memory_mib {
+                bail!("job {} requests more memory than the host limit", job.id);
+            }
+            let requested_slots = match &job.resources.compile_slots {
+                CompileSlots::Exact(value) => (*value).max(1),
+                CompileSlots::Auto(_) => free_slots.clamp(1, 4),
+            };
+            if job.exclusive.is_some() && !self.running.is_empty() {
+                // An explicitly authorized exclusive job is a drain barrier.
+                // Lower-priority work must not keep it waiting indefinitely.
+                return Ok(None);
+            }
+            if requested_slots <= free_slots
+                && host.available_memory_mib
+                    >= requested_memory.saturating_add(limits.host_memory_reserve_mib)
+                && host.cpu_pressure_some_avg10 <= limits.cpu_pressure_limit
+                && host.memory_pressure_full_avg10 <= limits.memory_pressure_limit
+                && host.io_pressure_full_avg10 <= limits.io_pressure_limit
+                && !job.locks.iter().any(|lock| self.locks.contains(lock))
+            {
+                selected = Some((key.clone(), requested_slots, requested_memory));
+                break;
+            }
         }
+        let Some((key, requested_slots, requested_memory)) = selected else {
+            return Ok(None);
+        };
+        let job = self.jobs.get(&key.id).expect("queue points to job");
         self.queue.remove(&key);
         for lock in &job.locks {
             self.locks.insert(lock.clone());
@@ -281,6 +290,7 @@ mod tests {
                 memory_mib: 512,
             },
             locks: Vec::new(),
+            exclusive: None,
             timeout_seconds: 10,
             retry_on_runner_restart: 0,
             output_ttl_seconds: 10,
@@ -318,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn docker_builds_run_exclusively() {
+    fn ordinary_docker_build_can_share_host_capacity() {
         let mut scheduler = Scheduler::default();
         let running = job(50);
         let mut docker = job(100);
@@ -330,21 +340,50 @@ mod tests {
         };
         scheduler.next(&Limits::default(), &host).unwrap().unwrap();
         scheduler.enqueue(docker).unwrap();
-        assert!(scheduler.next(&Limits::default(), &host).unwrap().is_none());
+        assert!(scheduler.next(&Limits::default(), &host).unwrap().is_some());
     }
 
     #[test]
-    fn a_running_docker_build_blocks_other_jobs() {
+    fn explicit_exclusive_job_drains_then_blocks_the_host() {
         let mut scheduler = Scheduler::default();
         let mut docker = job(100);
         docker.profile = JobProfile::DockerBuild;
-        scheduler.enqueue(docker).unwrap();
+        docker.exclusive = Some(zrunner_protocol::ExclusivityRequest {
+            reason: "qualify bounded builder".to_owned(),
+        });
+        let ordinary = job(110);
+        scheduler.enqueue(ordinary.clone()).unwrap();
         let host = HostCapacity {
             available_memory_mib: 16_000,
             ..HostCapacity::default()
         };
         scheduler.next(&Limits::default(), &host).unwrap().unwrap();
+        scheduler.enqueue(docker.clone()).unwrap();
+        assert!(scheduler.next(&Limits::default(), &host).unwrap().is_none());
+        scheduler.finish(ordinary.id).unwrap();
+        let (selected, _) = scheduler.next(&Limits::default(), &host).unwrap().unwrap();
+        assert_eq!(selected.id, docker.id);
         scheduler.enqueue(job(50)).unwrap();
         assert!(scheduler.next(&Limits::default(), &host).unwrap().is_none());
+    }
+
+    #[test]
+    fn blocked_ordinary_head_does_not_strand_capacity() {
+        let mut scheduler = Scheduler::default();
+        let mut lock_owner = job(110);
+        lock_owner.locks.push("shared".to_owned());
+        let mut blocked = job(100);
+        blocked.locks.push("shared".to_owned());
+        let backfill = job(50);
+        scheduler.enqueue(lock_owner.clone()).unwrap();
+        scheduler.enqueue(blocked).unwrap();
+        scheduler.enqueue(backfill.clone()).unwrap();
+        let host = HostCapacity {
+            available_memory_mib: 16_000,
+            ..HostCapacity::default()
+        };
+        scheduler.next(&Limits::default(), &host).unwrap().unwrap();
+        let (selected, _) = scheduler.next(&Limits::default(), &host).unwrap().unwrap();
+        assert_eq!(selected.id, backfill.id);
     }
 }

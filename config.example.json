@@ -3,6 +3,10 @@
   "board_root": "/home/zcourts/projects/projects/.ai/message-board",
   "runner": "debian1",
   "docker_builder": "zrunner-debian1",
+  "exclusive": {
+    "allowed_projects": ["infra"],
+    "allowed_profiles": ["docker-build"]
+  },
   "limits": {
     "max_running_jobs": 2,
     "max_compile_slots": 6,

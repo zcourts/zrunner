@@ -26,8 +26,11 @@ of competing compilers, linkers, and BuildKit workers.
   the same Cargo target, release directory, device, or other exclusive
   resource.
 - **Bound Docker builds too.** A runner-owned Buildx/BuildKit worker has explicit
-  CPU, memory, swap, and internal parallelism limits. Docker builds run
-  exclusively and cannot select an unbounded builder of their own.
+  CPU, memory, swap, and internal parallelism limits. Its named lock serializes
+  access to that builder without blocking unrelated jobs.
+- **Reserve exclusivity for exceptional work.** Host-wide exclusivity is an
+  explicit, reason-bearing request restricted by runner policy to approved
+  submitter projects and job profiles. Routine builds cannot drain the host.
 - **See output where coordination happens.** Stdout and stderr are independently
   buffered and published to a job-specific Zboard group, with ordered sequence
   numbers and Base64 preservation for non-UTF-8 output.
@@ -66,6 +69,11 @@ custom build language required:
 }
 ```
 
+An approved exceptional job adds a reason-bearing request such as
+`"exclusive":{"reason":"approved qualification requiring an idle host"}`;
+the runner still rejects it unless the message's submitter project and job
+profile are allowlisted locally.
+
 Zrunner publishes a durable lifecycle from `accepted` and `queued` through
 `started` to `completed`, `failed`, `cancelled`, or `rejected`. Output events
 arrive in the job group while it runs, so the submitting agent can follow the
@@ -81,7 +89,9 @@ Zrunner separates coordination from execution:
 1. An agent publishes a versioned job envelope to Zboard.
 2. The host-local runner restores its durable queue and orders ready work by
    priority, submission time, and ULID.
-3. Resource admission and named locks determine whether the next job can start.
+3. Resource admission and named locks select the highest-priority job that can
+   start, allowing unrelated work to use capacity behind a temporarily blocked
+   ordinary job.
 4. The command runs directly as a supervised child process with closed stdin.
 5. Buffered output and a final status return to the job's Zboard group.
 

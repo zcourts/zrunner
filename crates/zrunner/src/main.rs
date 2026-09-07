@@ -38,7 +38,17 @@ struct Config {
     #[serde(default)]
     docker_builder: Option<String>,
     #[serde(default)]
+    exclusive: ExclusivePolicy,
+    #[serde(default)]
     limits: ConfigLimits,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ExclusivePolicy {
+    #[serde(default)]
+    allowed_projects: Vec<String>,
+    #[serde(default)]
+    allowed_profiles: Vec<JobProfile>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -137,6 +147,7 @@ struct RunningJob {
 struct Termination {
     sent_at: Instant,
     state: JobState,
+    process_groups: HashSet<i32>,
 }
 
 fn main() {
@@ -171,6 +182,7 @@ fn run_main() -> Result<()> {
             profile: JobProfile::Rust,
             resources: Default::default(),
             locks: vec![format!("cargo-target:{}", default_runner())],
+            exclusive: None,
             timeout_seconds: 3600,
             retry_on_runner_restart: 1,
             output_ttl_seconds: 86400,
@@ -220,7 +232,7 @@ struct Daemon {
     running: HashMap<Ulid, RunningJob>,
     terminal: HashSet<Ulid>,
     history_replayed: bool,
-    pending_live_protocols: Vec<Value>,
+    pending_live_protocols: Vec<ProtocolMessage>,
     _lock: fs::File,
 }
 
@@ -355,7 +367,7 @@ impl Daemon {
         match value.get("type").and_then(Value::as_str) {
             Some("message") => {
                 if let Some(message) = value.get("message")
-                    && let Some(protocol) = protocol_value(message)
+                    && let Some(protocol) = protocol_message(message)
                 {
                     if self.history_replayed {
                         self.handle_protocol_value(protocol, true)?;
@@ -386,7 +398,8 @@ impl Daemon {
         Ok(())
     }
 
-    fn handle_protocol_value(&mut self, value: Value, announce: bool) -> Result<()> {
+    fn handle_protocol_value(&mut self, protocol: ProtocolMessage, announce: bool) -> Result<()> {
+        let value = protocol.value;
         match value.get("schema").and_then(Value::as_str) {
             Some(JOB_SCHEMA) => {
                 let mut job: Job = match serde_json::from_value(value) {
@@ -397,6 +410,13 @@ impl Daemon {
                     }
                 };
                 if job.runner == self.config.runner && !self.terminal.contains(&job.id) {
+                    if let Some(rejection) =
+                        exclusive_rejection(&self.config.exclusive, protocol.from.as_deref(), &job)
+                    {
+                        self.publish_state(&job, JobState::Rejected, Some(&rejection), None)?;
+                        self.terminal.insert(job.id);
+                        return Ok(());
+                    }
                     if matches!(job.profile, JobProfile::DockerBuild) {
                         let Some(builder) = self.config.docker_builder.as_deref() else {
                             self.publish_state(
@@ -462,11 +482,13 @@ impl Daemon {
                                 None,
                             )?;
                         } else if let Some(running) = self.running.get(&control.job) {
-                            signal_group(running.child.id(), libc::SIGTERM)?;
+                            let process_groups = process_groups_for_tree(running.child.id())?;
+                            signal_process_groups(&process_groups, libc::SIGTERM)?;
                             let running = self.running.get_mut(&control.job).expect("running job");
                             running.termination = Some(Termination {
                                 sent_at: Instant::now(),
                                 state: JobState::Cancelled,
+                                process_groups,
                             });
                         }
                     }
@@ -531,8 +553,10 @@ impl Daemon {
             &job,
             JobState::Started,
             Some(&format!(
-                "compile_slots={} memory_mib={}",
-                allocation.compile_slots, allocation.memory_mib
+                "compile_slots={} memory_mib={} exclusive={}",
+                allocation.compile_slots,
+                allocation.memory_mib,
+                job.exclusive.is_some()
             )),
             None,
         )?;
@@ -561,10 +585,12 @@ impl Daemon {
             if timed_out {
                 let running = self.running.get_mut(&id).expect("running job");
                 if running.termination.is_none() {
-                    signal_group(running.child.id(), libc::SIGTERM)?;
+                    let process_groups = process_groups_for_tree(running.child.id())?;
+                    signal_process_groups(&process_groups, libc::SIGTERM)?;
                     running.termination = Some(Termination {
                         sent_at: Instant::now(),
                         state: JobState::Failed,
+                        process_groups,
                     });
                 }
             }
@@ -576,7 +602,12 @@ impl Daemon {
             });
             if force_kill {
                 let running = self.running.get(&id).expect("running job");
-                signal_group(running.child.id(), libc::SIGKILL)?;
+                let groups = &running
+                    .termination
+                    .as_ref()
+                    .expect("force kill requires termination")
+                    .process_groups;
+                signal_process_groups(groups, libc::SIGKILL)?;
             }
             let status = self
                 .running
@@ -585,6 +616,16 @@ impl Daemon {
                 .child
                 .try_wait()?;
             if let Some(status) = status {
+                if self
+                    .running
+                    .get(&id)
+                    .and_then(|running| running.termination.as_ref())
+                    .is_some_and(|termination| {
+                        process_groups_have_live_members(&termination.process_groups)
+                    })
+                {
+                    continue;
+                }
                 self.flush(id, OutputStream::Stdout)?;
                 self.flush(id, OutputStream::Stderr)?;
                 let running = self.running.remove(&id).expect("running job");
@@ -701,18 +742,32 @@ impl Daemon {
     }
 }
 
-fn protocol_value(message: &Value) -> Option<Value> {
-    if let Some(meta) = message.get("meta").filter(|value| !value.is_null()) {
-        return Some(meta.clone());
-    }
-    message
-        .get("message")
-        .and_then(Value::as_str)
-        .and_then(|body| serde_json::from_str(body).ok())
+#[derive(Clone, Debug)]
+struct ProtocolMessage {
+    value: Value,
+    from: Option<String>,
 }
 
-fn history_replay_order(value: &Value) -> u8 {
-    match value.get("schema").and_then(Value::as_str) {
+fn protocol_message(message: &Value) -> Option<ProtocolMessage> {
+    let value = if let Some(meta) = message.get("meta").filter(|value| !value.is_null()) {
+        meta.clone()
+    } else {
+        message
+            .get("message")
+            .and_then(Value::as_str)
+            .and_then(|body| serde_json::from_str(body).ok())?
+    };
+    Some(ProtocolMessage {
+        value,
+        from: message
+            .get("from")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn history_replay_order(protocol: &ProtocolMessage) -> u8 {
+    match protocol.value.get("schema").and_then(Value::as_str) {
         Some(EVENT_SCHEMA) => 0,
         Some(JOB_SCHEMA) => 1,
         Some(CONTROL_SCHEMA) => 2,
@@ -720,10 +775,38 @@ fn history_replay_order(value: &Value) -> u8 {
     }
 }
 
-fn sorted_history_protocols(history: &[Value]) -> Vec<Value> {
-    let mut protocols: Vec<_> = history.iter().filter_map(protocol_value).collect();
+fn sorted_history_protocols(history: &[Value]) -> Vec<ProtocolMessage> {
+    let mut protocols: Vec<_> = history.iter().filter_map(protocol_message).collect();
     protocols.sort_by_key(history_replay_order);
     protocols
+}
+
+fn exclusive_rejection(
+    policy: &ExclusivePolicy,
+    submitter: Option<&str>,
+    job: &Job,
+) -> Option<String> {
+    job.exclusive.as_ref()?;
+    let submitter = match submitter {
+        Some(submitter) => submitter,
+        None => return Some("exclusive jobs require an attributable submitter".to_owned()),
+    };
+    if !policy
+        .allowed_projects
+        .iter()
+        .any(|project| submitter.starts_with(&format!("{project}-")))
+    {
+        return Some(format!(
+            "submitter {submitter} is not allowed to request host exclusivity"
+        ));
+    }
+    if !policy.allowed_profiles.contains(&job.profile) {
+        return Some(format!(
+            "profile {:?} is not allowed to request host exclusivity",
+            job.profile
+        ));
+    }
+    None
 }
 
 fn spawn_stream(
@@ -793,18 +876,89 @@ fn validate_docker_build(job: &Job) -> Result<()> {
     Ok(())
 }
 
-fn signal_group(pid: u32, signal: i32) -> Result<()> {
-    let result = unsafe { libc::kill(-(pid as i32), signal) };
-    if result == 0 {
-        Ok(())
-    } else {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(anyhow!(error)).context("signal job process group")
+#[derive(Clone, Copy, Debug)]
+struct ProcessStat {
+    pid: u32,
+    state: char,
+    parent: u32,
+    group: i32,
+}
+
+fn process_groups_for_tree(root: u32) -> Result<HashSet<i32>> {
+    let processes = process_stats()?;
+    let mut members = HashSet::from([root]);
+    loop {
+        let before = members.len();
+        for process in &processes {
+            if members.contains(&process.parent) {
+                members.insert(process.pid);
+            }
+        }
+        if members.len() == before {
+            break;
         }
     }
+    let mut groups = HashSet::from([root as i32]);
+    groups.extend(
+        processes
+            .iter()
+            .filter(|process| members.contains(&process.pid))
+            .map(|process| process.group),
+    );
+    Ok(groups)
+}
+
+fn process_groups_have_live_members(groups: &HashSet<i32>) -> bool {
+    process_stats().is_ok_and(|processes| {
+        processes
+            .iter()
+            .any(|process| groups.contains(&process.group) && process.state != 'Z')
+    })
+}
+
+fn process_stats() -> Result<Vec<ProcessStat>> {
+    let mut processes = Vec::new();
+    for entry in fs::read_dir("/proc").context("scan /proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if let Some(process) = parse_process_stat(pid, &stat) {
+            processes.push(process);
+        }
+    }
+    Ok(processes)
+}
+
+fn parse_process_stat(pid: u32, stat: &str) -> Option<ProcessStat> {
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let mut fields = fields.split_whitespace();
+    Some(ProcessStat {
+        pid,
+        state: fields.next()?.chars().next()?,
+        parent: fields.next()?.parse().ok()?,
+        group: fields.next()?.parse().ok()?,
+    })
+}
+
+fn signal_process_groups(groups: &HashSet<i32>, signal: i32) -> Result<()> {
+    for group in groups {
+        let result = unsafe { libc::kill(-group, signal) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(anyhow!(error)).context("signal job process group");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -821,7 +975,7 @@ mod tests {
             "meta":{"schema":"zrunner.job.v1","id":"01M1WKTEST"}
         });
         assert_eq!(
-            protocol_value(&message),
+            protocol_message(&message).map(|protocol| protocol.value),
             Some(json!({"schema":"zrunner.job.v1","id":"01M1WKTEST"}))
         );
     }
@@ -832,16 +986,20 @@ mod tests {
             "message":"{\"schema\":\"zrunner.control.v1\",\"action\":\"cancel\"}"
         });
         assert_eq!(
-            protocol_value(&message),
+            protocol_message(&message).map(|protocol| protocol.value),
             Some(json!({"schema":"zrunner.control.v1","action":"cancel"}))
         );
     }
 
     #[test]
     fn history_replays_terminal_events_before_job_submissions() {
-        assert_eq!(history_replay_order(&json!({"schema":EVENT_SCHEMA})), 0);
-        assert_eq!(history_replay_order(&json!({"schema":JOB_SCHEMA})), 1);
-        assert_eq!(history_replay_order(&json!({"schema":CONTROL_SCHEMA})), 2);
+        let protocol = |schema| ProtocolMessage {
+            value: json!({"schema":schema}),
+            from: None,
+        };
+        assert_eq!(history_replay_order(&protocol(EVENT_SCHEMA)), 0);
+        assert_eq!(history_replay_order(&protocol(JOB_SCHEMA)), 1);
+        assert_eq!(history_replay_order(&protocol(CONTROL_SCHEMA)), 2);
     }
 
     #[test]
@@ -850,12 +1008,15 @@ mod tests {
             "message":"old durable job",
             "meta":{"schema":JOB_SCHEMA,"id":"old-job"}
         })];
-        let pending = [json!({"schema":JOB_SCHEMA,"id":"new-job"})];
+        let pending = [ProtocolMessage {
+            value: json!({"schema":JOB_SCHEMA,"id":"new-job"}),
+            from: Some("worka-test".to_owned()),
+        }];
         let mut protocols = sorted_history_protocols(&history);
         protocols.extend(pending);
 
-        assert_eq!(protocols[0]["id"], "old-job");
-        assert_eq!(protocols[1]["id"], "new-job");
+        assert_eq!(protocols[0].value["id"], "old-job");
+        assert_eq!(protocols[1].value["id"], "new-job");
     }
 
     #[test]
@@ -878,6 +1039,7 @@ mod tests {
             profile: JobProfile::DockerBuild,
             resources: ResourceRequest::default(),
             locks: Vec::new(),
+            exclusive: None,
             timeout_seconds: 60,
             retry_on_runner_restart: 0,
             output_ttl_seconds: 60,
@@ -885,5 +1047,50 @@ mod tests {
         assert!(validate_docker_build(&job).is_ok());
         job.argv.push("--builder=unbounded".to_owned());
         assert!(validate_docker_build(&job).is_err());
+    }
+
+    #[test]
+    fn exclusivity_requires_an_allowed_project_profile_and_reason() {
+        let id = Ulid::new();
+        let mut job = Job {
+            schema: JOB_SCHEMA.to_owned(),
+            id,
+            runner: "debian1".to_owned(),
+            group: format!("job-{}", id.to_string().to_ascii_lowercase()),
+            cwd: "/tmp".to_owned(),
+            argv: vec!["true".to_owned()],
+            env: BTreeMap::new(),
+            priority: 0,
+            profile: JobProfile::DockerBuild,
+            resources: ResourceRequest::default(),
+            locks: Vec::new(),
+            exclusive: Some(zrunner_protocol::ExclusivityRequest {
+                reason: "qualify BuildKit isolation".to_owned(),
+            }),
+            timeout_seconds: 60,
+            retry_on_runner_restart: 0,
+            output_ttl_seconds: 60,
+        };
+        let policy = ExclusivePolicy {
+            allowed_projects: vec!["infra".to_owned()],
+            allowed_profiles: vec![JobProfile::DockerBuild],
+        };
+        assert_eq!(
+            exclusive_rejection(&policy, Some("infra-session"), &job),
+            None
+        );
+        assert!(exclusive_rejection(&policy, Some("worka-session"), &job).is_some());
+        job.profile = JobProfile::Rust;
+        assert!(exclusive_rejection(&policy, Some("infra-session"), &job).is_some());
+    }
+
+    #[test]
+    fn parses_proc_stat_with_parentheses_in_the_command_name() {
+        let stat = "123 (cargo (worker)) S 42 77 77 0 -1";
+        let parsed = parse_process_stat(123, stat).unwrap();
+        assert_eq!(parsed.pid, 123);
+        assert_eq!(parsed.state, 'S');
+        assert_eq!(parsed.parent, 42);
+        assert_eq!(parsed.group, 77);
     }
 }

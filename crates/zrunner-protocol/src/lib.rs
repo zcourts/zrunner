@@ -40,6 +40,11 @@ pub struct ResourceRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExclusivityRequest {
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Job {
     pub schema: String,
     pub id: Ulid,
@@ -56,6 +61,8 @@ pub struct Job {
     pub resources: ResourceRequest,
     #[serde(default)]
     pub locks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive: Option<ExclusivityRequest>,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
     #[serde(default)]
@@ -86,6 +93,13 @@ impl Job {
         }
         if self.locks.iter().any(String::is_empty) {
             return Err("locks must not be empty");
+        }
+        if self
+            .exclusive
+            .as_ref()
+            .is_some_and(|request| request.reason.trim().is_empty())
+        {
+            return Err("exclusive jobs require a reason");
         }
         Ok(())
     }
@@ -196,6 +210,7 @@ mod tests {
             profile: JobProfile::Rust,
             resources: ResourceRequest::default(),
             locks: Vec::new(),
+            exclusive: None,
             timeout_seconds: 1,
             retry_on_runner_restart: 0,
             output_ttl_seconds: 1,
@@ -217,6 +232,7 @@ mod tests {
             profile: JobProfile::Generic,
             resources: ResourceRequest::default(),
             locks: Vec::new(),
+            exclusive: None,
             timeout_seconds: 1,
             retry_on_runner_restart: 0,
             output_ttl_seconds: 1,
