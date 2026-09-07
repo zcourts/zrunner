@@ -56,6 +56,7 @@ custom build language required:
     "id": "01M1...",
     "runner": "debian1",
     "group": "job-01m1...",
+    "project": "worka",
     "cwd": "/workspace/worka",
     "argv": ["cargo", "test", "--locked", "--workspace"],
     "env": {"RUST_BACKTRACE": "1"},
@@ -81,6 +82,11 @@ build just as it would follow a local process.
 
 Queued jobs may be cancelled or reprioritized. Running jobs are never displaced
 merely because a newer high-priority request arrives.
+
+When several projects are waiting, zrunner gives each project one running slot
+before admitting a second job from any represented project. If only one project
+has runnable work, it can use every available slot. Priority and FIFO ordering
+still decide among jobs currently eligible for admission.
 
 ## Designed for agent fleets
 

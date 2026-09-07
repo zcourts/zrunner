@@ -73,6 +73,7 @@ with the job envelope in the Zboard message's structured `meta` field in the
     "id": "01M1...",
     "runner": "debian1",
     "group": "job-01m1...",
+    "project": "worka",
     "cwd": "/home/zcourts/projects/projects/worka/worka",
     "argv": ["cargo", "test", "--locked", "--workspace"],
     "env": {"RUST_BACKTRACE": "1"},
@@ -111,7 +112,15 @@ the reserved `retry_on_runner_restart` field.
 ## Scheduling and enforcement
 
 The queue key is descending priority, ascending submission time, then ULID. The
-scheduler selects the highest-priority ordinary job whose locks and declared
+scheduler first represents every waiting project across available running slots.
+While a queued project has no running job, a project that is already represented
+cannot take another slot. Once all waiting projects are represented, remaining
+capacity may run additional jobs from those projects. Priority and FIFO order the
+eligible jobs within each admission pass. The runner validates an explicit job
+`project` against the Zboard submitter identity; legacy jobs derive it from that
+identity.
+
+The scheduler selects the highest-priority ordinary job whose locks and declared
 resource reservation fit, so a temporarily blocked ordinary head does not
 strand capacity. A job that can never fit configured hard limits is rejected
 rather than blocking the queue indefinitely.

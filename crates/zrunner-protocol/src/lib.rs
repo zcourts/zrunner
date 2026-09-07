@@ -50,6 +50,8 @@ pub struct Job {
     pub id: Ulid,
     pub runner: String,
     pub group: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     pub cwd: String,
     pub argv: Vec<String>,
     #[serde(default)]
@@ -78,6 +80,13 @@ impl Job {
         }
         if self.runner.is_empty() || self.group.is_empty() || self.cwd.is_empty() {
             return Err("runner, group, and cwd are required");
+        }
+        if self
+            .project
+            .as_ref()
+            .is_some_and(|project| project.trim().is_empty())
+        {
+            return Err("project must not be empty");
         }
         if self.group != format!("job-{}", self.id.to_string().to_ascii_lowercase()) {
             return Err("group must be job-<lowercase job ULID>");
@@ -203,6 +212,7 @@ mod tests {
             id,
             runner: "debian1".to_owned(),
             group: format!("job-{}", id.to_string().to_ascii_lowercase()),
+            project: None,
             cwd: "/tmp".to_owned(),
             argv: Vec::new(),
             env: BTreeMap::new(),
@@ -225,6 +235,7 @@ mod tests {
             id: Ulid::new(),
             runner: "debian1".to_owned(),
             group: "job-wrong".to_owned(),
+            project: None,
             cwd: "/tmp".to_owned(),
             argv: vec!["true".to_owned()],
             env: BTreeMap::new(),

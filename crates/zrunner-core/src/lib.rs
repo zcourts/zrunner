@@ -105,15 +105,24 @@ pub struct Allocation {
 
 #[derive(Default)]
 pub struct Scheduler {
-    jobs: HashMap<Ulid, Job>,
+    jobs: HashMap<Ulid, ScheduledJob>,
     queue: BTreeSet<QueueKey>,
     running: HashMap<Ulid, Allocation>,
     locks: HashSet<String>,
 }
 
+#[derive(Clone)]
+struct ScheduledJob {
+    job: Job,
+    project: String,
+}
+
 impl Scheduler {
-    pub fn enqueue(&mut self, job: Job) -> Result<bool> {
+    pub fn enqueue(&mut self, job: Job, project: String) -> Result<bool> {
         job.validate().map_err(anyhow::Error::msg)?;
+        if project.is_empty() {
+            bail!("job project is required");
+        }
         if self.jobs.contains_key(&job.id) {
             return Ok(false);
         }
@@ -121,36 +130,36 @@ impl Scheduler {
             priority: job.priority,
             id: job.id,
         });
-        self.jobs.insert(job.id, job);
+        self.jobs.insert(job.id, ScheduledJob { job, project });
         Ok(true)
     }
 
     pub fn set_priority(&mut self, id: Ulid, priority: i32) -> bool {
-        let Some(job) = self.jobs.get_mut(&id) else {
+        let Some(scheduled) = self.jobs.get_mut(&id) else {
             return false;
         };
         if self.running.contains_key(&id) {
             return false;
         }
         self.queue.remove(&QueueKey {
-            priority: job.priority,
+            priority: scheduled.job.priority,
             id,
         });
-        job.priority = priority;
+        scheduled.job.priority = priority;
         self.queue.insert(QueueKey { priority, id });
         true
     }
 
     pub fn cancel_queued(&mut self, id: Ulid) -> Option<Job> {
-        let job = self.jobs.get(&id)?;
+        let scheduled = self.jobs.get(&id)?;
         if self.running.contains_key(&id) {
             return None;
         }
         self.queue.remove(&QueueKey {
-            priority: job.priority,
+            priority: scheduled.job.priority,
             id,
         });
-        self.jobs.remove(&id)
+        self.jobs.remove(&id).map(|scheduled| scheduled.job)
     }
 
     pub fn next(
@@ -161,11 +170,11 @@ impl Scheduler {
         if self.running.len() >= limits.max_running_jobs || self.queue.is_empty() {
             return Ok(None);
         }
-        if self
-            .running
-            .keys()
-            .any(|id| self.jobs.get(id).is_some_and(|job| job.exclusive.is_some()))
-        {
+        if self.running.keys().any(|id| {
+            self.jobs
+                .get(id)
+                .is_some_and(|scheduled| scheduled.job.exclusive.is_some())
+        }) {
             return Ok(None);
         }
         let used_slots: u16 = self.running.values().map(|item| item.compile_slots).sum();
@@ -173,9 +182,31 @@ impl Scheduler {
         if free_slots == 0 {
             return Ok(None);
         }
+        let running_projects: HashSet<&str> = self
+            .running
+            .keys()
+            .filter_map(|id| {
+                self.jobs
+                    .get(id)
+                    .map(|scheduled| scheduled.project.as_str())
+            })
+            .collect();
+        let unrepresented_projects: HashSet<&str> = self
+            .queue
+            .iter()
+            .filter_map(|key| self.jobs.get(&key.id))
+            .map(|scheduled| scheduled.project.as_str())
+            .filter(|project| !running_projects.contains(project))
+            .collect();
         let mut selected = None;
         for key in &self.queue {
-            let job = self.jobs.get(&key.id).expect("queue points to job");
+            let scheduled = self.jobs.get(&key.id).expect("queue points to job");
+            if !unrepresented_projects.is_empty()
+                && !unrepresented_projects.contains(scheduled.project.as_str())
+            {
+                continue;
+            }
+            let job = &scheduled.job;
             let requested_memory = job.resources.memory_mib.max(512);
             if requested_memory > limits.max_job_memory_mib {
                 bail!("job {} requests more memory than the host limit", job.id);
@@ -204,7 +235,7 @@ impl Scheduler {
         let Some((key, requested_slots, requested_memory)) = selected else {
             return Ok(None);
         };
-        let job = self.jobs.get(&key.id).expect("queue points to job");
+        let job = &self.jobs.get(&key.id).expect("queue points to job").job;
         self.queue.remove(&key);
         for lock in &job.locks {
             self.locks.insert(lock.clone());
@@ -219,11 +250,11 @@ impl Scheduler {
 
     pub fn finish(&mut self, id: Ulid) -> Option<Job> {
         self.running.remove(&id)?;
-        let job = self.jobs.remove(&id)?;
-        for lock in &job.locks {
+        let scheduled = self.jobs.remove(&id)?;
+        for lock in &scheduled.job.locks {
             self.locks.remove(lock);
         }
-        Some(job)
+        Some(scheduled.job)
     }
 
     pub fn queued_len(&self) -> usize {
@@ -280,6 +311,7 @@ mod tests {
             id,
             runner: "debian1".to_owned(),
             group: format!("job-{}", id.to_string().to_ascii_lowercase()),
+            project: None,
             cwd: "/tmp".to_owned(),
             argv: vec!["true".to_owned()],
             env: BTreeMap::new(),
@@ -302,8 +334,8 @@ mod tests {
         let mut scheduler = Scheduler::default();
         let low = job(0);
         let high = job(50);
-        scheduler.enqueue(low.clone()).unwrap();
-        scheduler.enqueue(high.clone()).unwrap();
+        scheduler.enqueue(low.clone(), "alpha".to_owned()).unwrap();
+        scheduler.enqueue(high.clone(), "alpha".to_owned()).unwrap();
         let host = HostCapacity {
             available_memory_mib: 16_000,
             ..HostCapacity::default()
@@ -316,7 +348,9 @@ mod tests {
     fn reprioritizing_running_or_unknown_job_is_a_nonfatal_noop() {
         let mut scheduler = Scheduler::default();
         let running = job(0);
-        scheduler.enqueue(running.clone()).unwrap();
+        scheduler
+            .enqueue(running.clone(), "alpha".to_owned())
+            .unwrap();
         let host = HostCapacity {
             available_memory_mib: 16_000,
             ..HostCapacity::default()
@@ -333,13 +367,15 @@ mod tests {
         let running = job(50);
         let mut docker = job(100);
         docker.profile = JobProfile::DockerBuild;
-        scheduler.enqueue(running.clone()).unwrap();
+        scheduler
+            .enqueue(running.clone(), "alpha".to_owned())
+            .unwrap();
         let host = HostCapacity {
             available_memory_mib: 16_000,
             ..HostCapacity::default()
         };
         scheduler.next(&Limits::default(), &host).unwrap().unwrap();
-        scheduler.enqueue(docker).unwrap();
+        scheduler.enqueue(docker, "beta".to_owned()).unwrap();
         assert!(scheduler.next(&Limits::default(), &host).unwrap().is_some());
     }
 
@@ -352,18 +388,22 @@ mod tests {
             reason: "qualify bounded builder".to_owned(),
         });
         let ordinary = job(110);
-        scheduler.enqueue(ordinary.clone()).unwrap();
+        scheduler
+            .enqueue(ordinary.clone(), "alpha".to_owned())
+            .unwrap();
         let host = HostCapacity {
             available_memory_mib: 16_000,
             ..HostCapacity::default()
         };
         scheduler.next(&Limits::default(), &host).unwrap().unwrap();
-        scheduler.enqueue(docker.clone()).unwrap();
+        scheduler
+            .enqueue(docker.clone(), "beta".to_owned())
+            .unwrap();
         assert!(scheduler.next(&Limits::default(), &host).unwrap().is_none());
         scheduler.finish(ordinary.id).unwrap();
         let (selected, _) = scheduler.next(&Limits::default(), &host).unwrap().unwrap();
         assert_eq!(selected.id, docker.id);
-        scheduler.enqueue(job(50)).unwrap();
+        scheduler.enqueue(job(50), "alpha".to_owned()).unwrap();
         assert!(scheduler.next(&Limits::default(), &host).unwrap().is_none());
     }
 
@@ -375,9 +415,13 @@ mod tests {
         let mut blocked = job(100);
         blocked.locks.push("shared".to_owned());
         let backfill = job(50);
-        scheduler.enqueue(lock_owner.clone()).unwrap();
-        scheduler.enqueue(blocked).unwrap();
-        scheduler.enqueue(backfill.clone()).unwrap();
+        scheduler
+            .enqueue(lock_owner.clone(), "alpha".to_owned())
+            .unwrap();
+        scheduler.enqueue(blocked, "alpha".to_owned()).unwrap();
+        scheduler
+            .enqueue(backfill.clone(), "beta".to_owned())
+            .unwrap();
         let host = HostCapacity {
             available_memory_mib: 16_000,
             ..HostCapacity::default()
@@ -385,5 +429,74 @@ mod tests {
         scheduler.next(&Limits::default(), &host).unwrap().unwrap();
         let (selected, _) = scheduler.next(&Limits::default(), &host).unwrap().unwrap();
         assert_eq!(selected.id, backfill.id);
+    }
+
+    #[test]
+    fn represents_waiting_projects_before_admitting_a_duplicate() {
+        let mut scheduler = Scheduler::default();
+        let limits = Limits {
+            max_running_jobs: 4,
+            max_compile_slots: 4,
+            ..Limits::default()
+        };
+        let host = HostCapacity {
+            available_memory_mib: 16_000,
+            ..HostCapacity::default()
+        };
+        let fission_first = job(100);
+        let fission_second = job(90);
+        let worka = job(80);
+        let keldra = job(70);
+        let infra = job(60);
+        scheduler
+            .enqueue(fission_first.clone(), "fission".to_owned())
+            .unwrap();
+        scheduler
+            .enqueue(fission_second.clone(), "fission".to_owned())
+            .unwrap();
+        scheduler
+            .enqueue(worka.clone(), "worka".to_owned())
+            .unwrap();
+        scheduler
+            .enqueue(keldra.clone(), "keldra".to_owned())
+            .unwrap();
+        scheduler
+            .enqueue(infra.clone(), "infra".to_owned())
+            .unwrap();
+
+        let mut selected = Vec::new();
+        for _ in 0..4 {
+            selected.push(scheduler.next(&limits, &host).unwrap().unwrap().0.id);
+        }
+
+        assert_eq!(
+            selected,
+            vec![fission_first.id, worka.id, keldra.id, infra.id]
+        );
+        assert_eq!(scheduler.queued_len(), 1);
+    }
+
+    #[test]
+    fn one_project_can_fill_spare_capacity_when_nobody_else_waits() {
+        let mut scheduler = Scheduler::default();
+        let limits = Limits {
+            max_running_jobs: 4,
+            max_compile_slots: 4,
+            ..Limits::default()
+        };
+        let host = HostCapacity {
+            available_memory_mib: 16_000,
+            ..HostCapacity::default()
+        };
+        for priority in [40, 30, 20, 10] {
+            scheduler
+                .enqueue(job(priority), "fission".to_owned())
+                .unwrap();
+        }
+
+        for _ in 0..4 {
+            assert!(scheduler.next(&limits, &host).unwrap().is_some());
+        }
+        assert_eq!(scheduler.queued_len(), 0);
     }
 }

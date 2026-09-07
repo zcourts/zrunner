@@ -171,6 +171,7 @@ fn run_main() -> Result<()> {
             id,
             runner: default_runner(),
             group: format!("job-{}", id.to_string().to_ascii_lowercase()),
+            project: None,
             cwd: std::env::current_dir()?.to_string_lossy().into_owned(),
             argv: vec![
                 "cargo".to_owned(),
@@ -440,7 +441,20 @@ impl Daemon {
                         }
                         job.locks.push(format!("buildkit:{builder}"));
                     }
-                    let inserted = match self.scheduler.enqueue(job.clone()) {
+                    let project = match job_project(protocol.from.as_deref(), &job) {
+                        Ok(project) => project,
+                        Err(error) => {
+                            self.publish_state(
+                                &job,
+                                JobState::Rejected,
+                                Some(&format!("invalid job project: {error}")),
+                                None,
+                            )?;
+                            self.terminal.insert(job.id);
+                            return Ok(());
+                        }
+                    };
+                    let inserted = match self.scheduler.enqueue(job.clone(), project) {
                         Ok(inserted) => inserted,
                         Err(error) => {
                             self.publish_state(
@@ -809,6 +823,21 @@ fn exclusive_rejection(
     None
 }
 
+fn job_project(submitter: Option<&str>, job: &Job) -> Result<String, &'static str> {
+    let submitter = submitter.ok_or("jobs require an attributable submitter")?;
+    let derived = submitter
+        .split_once('-')
+        .map_or(submitter, |(project, _)| project);
+    let project = job.project.as_deref().unwrap_or(derived);
+    if project.is_empty() {
+        return Err("project is empty");
+    }
+    if submitter != project && !submitter.starts_with(&format!("{project}-")) {
+        return Err("project does not match the submitter");
+    }
+    Ok(project.to_owned())
+}
+
 fn spawn_stream(
     id: Ulid,
     stream: OutputStream,
@@ -1027,6 +1056,7 @@ mod tests {
             id,
             runner: "debian1".to_owned(),
             group: format!("job-{}", id.to_string().to_ascii_lowercase()),
+            project: None,
             cwd: "/tmp".to_owned(),
             argv: vec![
                 "docker".to_owned(),
@@ -1057,6 +1087,7 @@ mod tests {
             id,
             runner: "debian1".to_owned(),
             group: format!("job-{}", id.to_string().to_ascii_lowercase()),
+            project: None,
             cwd: "/tmp".to_owned(),
             argv: vec!["true".to_owned()],
             env: BTreeMap::new(),
@@ -1082,6 +1113,40 @@ mod tests {
         assert!(exclusive_rejection(&policy, Some("worka-session"), &job).is_some());
         job.profile = JobProfile::Rust;
         assert!(exclusive_rejection(&policy, Some("infra-session"), &job).is_some());
+    }
+
+    #[test]
+    fn job_project_is_bound_to_the_submitter() {
+        let id = Ulid::new();
+        let mut job = Job {
+            schema: JOB_SCHEMA.to_owned(),
+            id,
+            runner: "debian1".to_owned(),
+            group: format!("job-{}", id.to_string().to_ascii_lowercase()),
+            project: None,
+            cwd: "/tmp".to_owned(),
+            argv: vec!["true".to_owned()],
+            env: BTreeMap::new(),
+            priority: 0,
+            profile: JobProfile::Generic,
+            resources: ResourceRequest::default(),
+            locks: Vec::new(),
+            exclusive: None,
+            timeout_seconds: 60,
+            retry_on_runner_restart: 0,
+            output_ttl_seconds: 60,
+        };
+        assert_eq!(
+            job_project(Some("fission-session"), &job),
+            Ok("fission".to_owned())
+        );
+        job.project = Some("fission".to_owned());
+        assert_eq!(
+            job_project(Some("fission-session"), &job),
+            Ok("fission".to_owned())
+        );
+        job.project = Some("worka".to_owned());
+        assert!(job_project(Some("fission-session"), &job).is_err());
     }
 
     #[test]
