@@ -73,6 +73,11 @@ custom build language required:
 }
 ```
 
+Rust admission requires both the project-specific `CARGO_TARGET_DIR` and its
+matching `cargo-target:<runner>:<project>` lock. Jobs that omit either, target
+the platform-level directory, or request the cross-project lock are rejected
+before entering the queue.
+
 An approved exceptional job adds a reason-bearing request such as
 `"exclusive":{"reason":"approved qualification requiring an idle host"}`;
 the runner still rejects it unless the message's submitter project and job

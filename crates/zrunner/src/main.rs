@@ -469,6 +469,16 @@ impl Daemon {
                             return Ok(());
                         }
                     };
+                    if let Err(error) = validate_rust_target(&job, &project) {
+                        self.publish_state(
+                            &job,
+                            JobState::Rejected,
+                            Some(&format!("invalid Rust build target: {error:#}")),
+                            None,
+                        )?;
+                        self.terminal.insert(job.id);
+                        return Ok(());
+                    }
                     let inserted = match self.scheduler.enqueue(job.clone(), project) {
                         Ok(inserted) => inserted,
                         Err(error) => {
@@ -920,6 +930,39 @@ fn validate_docker_build(job: &Job) -> Result<()> {
     Ok(())
 }
 
+fn validate_rust_target(job: &Job, project: &str) -> Result<()> {
+    if !matches!(job.profile, JobProfile::Rust) {
+        return Ok(());
+    }
+
+    let expected_target = format!(
+        "/home/zcourts/projects/projects/build/{}/{project}",
+        job.runner
+    );
+    match job.env.get("CARGO_TARGET_DIR") {
+        Some(target) if target == &expected_target => {}
+        Some(target) => bail!("CARGO_TARGET_DIR must be {expected_target}, not {target}"),
+        None => bail!("CARGO_TARGET_DIR must be set to {expected_target}"),
+    }
+
+    let expected_lock = format!("cargo-target:{}:{project}", job.runner);
+    if !job.locks.iter().any(|lock| lock == &expected_lock) {
+        bail!("job must hold {expected_lock}");
+    }
+    if job
+        .locks
+        .iter()
+        .any(|lock| lock == &format!("cargo-target:{}", job.runner))
+    {
+        bail!(
+            "job must not hold the cross-project cargo-target:{} lock",
+            job.runner
+        );
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ProcessStat {
     pid: u32,
@@ -1104,6 +1147,47 @@ mod tests {
         assert!(validate_docker_build(&job).is_ok());
         job.argv.push("--builder=unbounded".to_owned());
         assert!(validate_docker_build(&job).is_err());
+    }
+
+    #[test]
+    fn rust_jobs_require_the_project_target_and_lock() {
+        let id = Ulid::new();
+        let mut job = Job {
+            schema: JOB_SCHEMA.to_owned(),
+            id,
+            runner: "debian1".to_owned(),
+            group: format!("job-{}", id.to_string().to_ascii_lowercase()),
+            project: None,
+            cwd: "/home/zcourts/projects/projects/worka/worka".to_owned(),
+            argv: vec!["cargo".to_owned(), "check".to_owned()],
+            env: BTreeMap::new(),
+            priority: 0,
+            profile: JobProfile::Rust,
+            resources: ResourceRequest::default(),
+            locks: Vec::new(),
+            exclusive: None,
+            timeout_seconds: 60,
+            retry_on_runner_restart: 0,
+            output_ttl_seconds: 60,
+        };
+
+        assert!(validate_rust_target(&job, "worka").is_err());
+        job.env.insert(
+            "CARGO_TARGET_DIR".to_owned(),
+            "/home/zcourts/projects/projects/build/debian1/worka".to_owned(),
+        );
+        assert!(validate_rust_target(&job, "worka").is_err());
+        job.locks.push("cargo-target:debian1:worka".to_owned());
+        assert!(validate_rust_target(&job, "worka").is_ok());
+
+        job.locks.push("cargo-target:debian1".to_owned());
+        assert!(validate_rust_target(&job, "worka").is_err());
+        job.locks.pop();
+        job.env.insert(
+            "CARGO_TARGET_DIR".to_owned(),
+            "/home/zcourts/projects/projects/build/debian1".to_owned(),
+        );
+        assert!(validate_rust_target(&job, "worka").is_err());
     }
 
     #[test]

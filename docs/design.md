@@ -91,6 +91,12 @@ with the job envelope in the Zboard message's structured `meta` field in the
 }
 ```
 
+For Rust jobs, admission verifies that `CARGO_TARGET_DIR` is exactly the
+project directory beneath `build/<runner>/` and that the matching
+`cargo-target:<runner>:<project>` lock is present. The platform-level target and
+cross-project Cargo lock are rejected so one project cannot recreate global
+target contention.
+
 The runner temporarily accepts the original JSON-string `message` form so
 already queued jobs survive the live upgrade. New producers use `meta`.
 
