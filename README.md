@@ -85,7 +85,7 @@ merely because a newer high-priority request arrives.
 
 When several projects are waiting, zrunner gives each project one running slot
 before admitting a second job from any represented project. If only one project
-has runnable work, it can use every available slot. Priority and FIFO ordering
+has waiting work, it can use every available slot. Priority and FIFO ordering
 still decide among jobs currently eligible for admission.
 
 ## Designed for agent fleets
