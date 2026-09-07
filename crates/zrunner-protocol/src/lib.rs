@@ -72,6 +72,9 @@ impl Job {
         if self.runner.is_empty() || self.group.is_empty() || self.cwd.is_empty() {
             return Err("runner, group, and cwd are required");
         }
+        if self.group != format!("job-{}", self.id.to_string().to_ascii_lowercase()) {
+            return Err("group must be job-<lowercase job ULID>");
+        }
         if self.argv.is_empty() || self.argv[0].is_empty() {
             return Err("argv must contain a program");
         }
@@ -180,11 +183,12 @@ mod tests {
 
     #[test]
     fn rejects_empty_command() {
+        let id = Ulid::new();
         let job = Job {
             schema: JOB_SCHEMA.to_owned(),
-            id: Ulid::new(),
+            id,
             runner: "debian1".to_owned(),
-            group: "job-one".to_owned(),
+            group: format!("job-{}", id.to_string().to_ascii_lowercase()),
             cwd: "/tmp".to_owned(),
             argv: Vec::new(),
             env: BTreeMap::new(),
@@ -197,5 +201,32 @@ mod tests {
             output_ttl_seconds: 1,
         };
         assert_eq!(job.validate(), Err("argv must contain a program"));
+    }
+
+    #[test]
+    fn rejects_a_group_that_does_not_match_the_job_id() {
+        let mut job = Job {
+            schema: JOB_SCHEMA.to_owned(),
+            id: Ulid::new(),
+            runner: "debian1".to_owned(),
+            group: "job-wrong".to_owned(),
+            cwd: "/tmp".to_owned(),
+            argv: vec!["true".to_owned()],
+            env: BTreeMap::new(),
+            priority: 0,
+            profile: JobProfile::Generic,
+            resources: ResourceRequest::default(),
+            locks: Vec::new(),
+            timeout_seconds: 1,
+            retry_on_runner_restart: 0,
+            output_ttl_seconds: 1,
+        };
+        let expected = format!("job-{}", job.id.to_string().to_ascii_lowercase());
+        assert_eq!(
+            job.validate(),
+            Err("group must be job-<lowercase job ULID>")
+        );
+        job.group = expected;
+        assert_eq!(job.validate(), Ok(()));
     }
 }

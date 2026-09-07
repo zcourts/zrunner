@@ -1,5 +1,5 @@
 {
-  "aiboard": "/home/zcourts/projects/projects/releases/aiboard/0.3.0/linux-aarch64/aiboard",
+  "zboard": "/home/zcourts/projects/projects/releases/zboard/0.4.0/linux-aarch64/zboard",
   "board_root": "/home/zcourts/projects/projects/.ai/message-board",
   "runner": "debian1",
   "limits": {

@@ -29,8 +29,8 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    #[serde(default = "default_aiboard")]
-    aiboard: PathBuf,
+    #[serde(default = "default_zboard", alias = "aiboard")]
+    zboard: PathBuf,
     #[serde(default = "default_root")]
     board_root: PathBuf,
     #[serde(default = "default_runner")]
@@ -86,8 +86,8 @@ impl Config {
     }
 }
 
-fn default_aiboard() -> PathBuf {
-    PathBuf::from("aiboard")
+fn default_zboard() -> PathBuf {
+    PathBuf::from("zboard")
 }
 
 fn default_root() -> PathBuf {
@@ -217,6 +217,8 @@ struct Daemon {
     scheduler: Scheduler,
     running: HashMap<Ulid, RunningJob>,
     terminal: HashSet<Ulid>,
+    history_replayed: bool,
+    pending_live_protocols: Vec<Value>,
     _lock: fs::File,
 }
 
@@ -235,7 +237,7 @@ impl Daemon {
             bail!("another zrunner daemon owns {}", lock_path.display());
         }
 
-        let mut board = Command::new(&config.aiboard)
+        let mut board = Command::new(&config.zboard)
             .arg("run")
             .arg("--root")
             .arg(&config.board_root)
@@ -247,9 +249,9 @@ impl Daemon {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .context("start AI Board transport")?;
-        let board_input = board.stdin.take().context("open AI Board stdin")?;
-        let board_output = board.stdout.take().context("open AI Board stdout")?;
+            .context("start Zboard transport")?;
+        let board_input = board.stdin.take().context("open Zboard stdin")?;
+        let board_output = board.stdout.take().context("open Zboard stdout")?;
         let (event_tx, events) = mpsc::channel();
         let board_tx = event_tx.clone();
         thread::spawn(move || {
@@ -261,10 +263,10 @@ impl Daemon {
                                 break;
                             }
                         }
-                        Err(error) => eprintln!("zrunner: invalid AI Board output: {error}"),
+                        Err(error) => eprintln!("zrunner: invalid Zboard output: {error}"),
                     },
                     Err(error) => {
-                        eprintln!("zrunner: read AI Board output: {error}");
+                        eprintln!("zrunner: read Zboard output: {error}");
                         break;
                     }
                 }
@@ -281,6 +283,8 @@ impl Daemon {
             scheduler: Scheduler::default(),
             running: HashMap::new(),
             terminal: HashSet::new(),
+            history_replayed: false,
+            pending_live_protocols: Vec::new(),
             _lock: lock,
         })
     }
@@ -310,7 +314,7 @@ impl Daemon {
                 last_admission = Instant::now();
             }
             if self.board.try_wait()?.is_some() {
-                bail!("AI Board transport exited");
+                bail!("Zboard transport exited");
             }
         }
     }
@@ -345,33 +349,39 @@ impl Daemon {
     fn handle_board(&mut self, value: Value) -> Result<()> {
         match value.get("type").and_then(Value::as_str) {
             Some("message") => {
-                if let Some(body) = value.pointer("/message/message").and_then(Value::as_str) {
-                    self.handle_protocol_body(body)?;
-                }
-            }
-            Some("history") => {
-                if let Some(messages) = value.get("messages").and_then(Value::as_array) {
-                    let bodies: Vec<_> = messages
-                        .iter()
-                        .filter_map(|message| message.get("message"))
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect();
-                    for body in bodies {
-                        self.handle_protocol_body(&body)?;
+                if let Some(message) = value.get("message")
+                    && let Some(protocol) = protocol_value(message)
+                {
+                    if self.history_replayed {
+                        self.handle_protocol_value(protocol, true)?;
+                    } else {
+                        self.pending_live_protocols.push(protocol);
                     }
                 }
             }
-            Some("error") => eprintln!("zrunner: AI Board error: {value}"),
+            Some("history") => {
+                if !self.history_replayed {
+                    let messages = value
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    for protocol in sorted_history_protocols(messages) {
+                        self.handle_protocol_value(protocol, false)?;
+                    }
+                    self.history_replayed = true;
+                    for protocol in std::mem::take(&mut self.pending_live_protocols) {
+                        self.handle_protocol_value(protocol, true)?;
+                    }
+                }
+            }
+            Some("error") => eprintln!("zrunner: Zboard error: {value}"),
             _ => {}
         }
         Ok(())
     }
 
-    fn handle_protocol_body(&mut self, body: &str) -> Result<()> {
-        let Ok(value) = serde_json::from_str::<Value>(body) else {
-            return Ok(());
-        };
+    fn handle_protocol_value(&mut self, value: Value, announce: bool) -> Result<()> {
         match value.get("schema").and_then(Value::as_str) {
             Some(JOB_SCHEMA) => {
                 let job: Job = match serde_json::from_value(value) {
@@ -406,14 +416,23 @@ impl Daemon {
                         }
                     };
                     if inserted {
+                        self.board_command(json!({"op":"group.create","name":job.group}))?;
                         self.board_command(json!({"op":"group.join","name":job.group}))?;
-                        self.publish_state(&job, JobState::Accepted, None, None)?;
-                        self.publish_state(&job, JobState::Queued, None, None)?;
+                        if announce {
+                            self.publish_state(&job, JobState::Accepted, None, None)?;
+                            self.publish_state(&job, JobState::Queued, None, None)?;
+                        }
                     }
                 }
             }
             Some(CONTROL_SCHEMA) => {
-                let control: Control = serde_json::from_value(value)?;
+                let control: Control = match serde_json::from_value(value) {
+                    Ok(control) => control,
+                    Err(error) => {
+                        eprintln!("zrunner: ignore malformed control: {error}");
+                        return Ok(());
+                    }
+                };
                 match control.action {
                     ControlAction::Cancel => {
                         if let Some(job) = self.scheduler.cancel_queued(control.job) {
@@ -434,12 +453,23 @@ impl Daemon {
                         }
                     }
                     ControlAction::SetPriority { priority } => {
-                        self.scheduler.set_priority(control.job, priority)?;
+                        if !self.scheduler.set_priority(control.job, priority) {
+                            eprintln!(
+                                "zrunner: ignore priority change for unknown, running, or terminal job {}",
+                                control.job
+                            );
+                        }
                     }
                 }
             }
             Some(EVENT_SCHEMA) => {
-                let event: JobEvent = serde_json::from_value(value)?;
+                let event: JobEvent = match serde_json::from_value(value) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        eprintln!("zrunner: ignore malformed lifecycle event: {error}");
+                        return Ok(());
+                    }
+                };
                 if event.runner == self.config.runner && event.state.is_terminal() {
                     self.terminal.insert(event.job);
                     self.scheduler.cancel_queued(event.job);
@@ -601,10 +631,12 @@ impl Daemon {
         };
         let group = running.job.group.clone();
         let ttl = running.job.output_ttl_seconds;
+        let summary = format!("job {id} {stream:?} output #{}", running.sequence);
         self.board_command(json!({
             "op":"send",
             "group":group,
-            "message":serde_json::to_string(&output)?,
+            "message":summary,
+            "meta":output,
             "ttl_seconds":ttl
         }))
     }
@@ -627,18 +659,45 @@ impl Daemon {
             exit_code,
             last_sequence: self.running.get(&job.id).map(|running| running.sequence),
         };
+        let summary = format!("job {} {state:?}", job.id).to_ascii_lowercase();
         self.board_command(json!({
             "op":"send",
             "group":"zrunner",
-            "message":serde_json::to_string(&event)?
+            "message":summary,
+            "meta":event
         }))
     }
 
     fn board_command(&mut self, value: Value) -> Result<()> {
         serde_json::to_writer(&mut self.board_input, &value)?;
         self.board_input.write_all(b"\n")?;
-        self.board_input.flush().context("flush AI Board command")
+        self.board_input.flush().context("flush Zboard command")
     }
+}
+
+fn protocol_value(message: &Value) -> Option<Value> {
+    if let Some(meta) = message.get("meta").filter(|value| !value.is_null()) {
+        return Some(meta.clone());
+    }
+    message
+        .get("message")
+        .and_then(Value::as_str)
+        .and_then(|body| serde_json::from_str(body).ok())
+}
+
+fn history_replay_order(value: &Value) -> u8 {
+    match value.get("schema").and_then(Value::as_str) {
+        Some(EVENT_SCHEMA) => 0,
+        Some(JOB_SCHEMA) => 1,
+        Some(CONTROL_SCHEMA) => 2,
+        _ => 3,
+    }
+}
+
+fn sorted_history_protocols(history: &[Value]) -> Vec<Value> {
+    let mut protocols: Vec<_> = history.iter().filter_map(protocol_value).collect();
+    protocols.sort_by_key(history_replay_order);
+    protocols
 }
 
 fn spawn_stream(
@@ -702,5 +761,54 @@ fn signal_group(pid: u32, signal: i32) -> Result<()> {
         } else {
             Err(anyhow!(error)).context("signal job process group")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_meta_is_the_protocol_payload() {
+        let message = json!({
+            "message":"queue job",
+            "meta":{"schema":"zrunner.job.v1","id":"01M1WKTEST"}
+        });
+        assert_eq!(
+            protocol_value(&message),
+            Some(json!({"schema":"zrunner.job.v1","id":"01M1WKTEST"}))
+        );
+    }
+
+    #[test]
+    fn legacy_json_string_remains_readable() {
+        let message = json!({
+            "message":"{\"schema\":\"zrunner.control.v1\",\"action\":\"cancel\"}"
+        });
+        assert_eq!(
+            protocol_value(&message),
+            Some(json!({"schema":"zrunner.control.v1","action":"cancel"}))
+        );
+    }
+
+    #[test]
+    fn history_replays_terminal_events_before_job_submissions() {
+        assert_eq!(history_replay_order(&json!({"schema":EVENT_SCHEMA})), 0);
+        assert_eq!(history_replay_order(&json!({"schema":JOB_SCHEMA})), 1);
+        assert_eq!(history_replay_order(&json!({"schema":CONTROL_SCHEMA})), 2);
+    }
+
+    #[test]
+    fn live_protocols_wait_behind_complete_history_replay() {
+        let history = vec![json!({
+            "message":"old durable job",
+            "meta":{"schema":JOB_SCHEMA,"id":"old-job"}
+        })];
+        let pending = [json!({"schema":JOB_SCHEMA,"id":"new-job"})];
+        let mut protocols = sorted_history_protocols(&history);
+        protocols.extend(pending);
+
+        assert_eq!(protocols[0]["id"], "old-job");
+        assert_eq!(protocols[1]["id"], "new-job");
     }
 }

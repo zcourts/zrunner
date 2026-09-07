@@ -9,7 +9,7 @@ Zrunner prevents independently operating AI agents from saturating one shared
 build host. It is a small Rust daemon, not an agent: it consumes no model tokens
 and makes only deterministic scheduling and resource-admission decisions.
 
-AI Board is the durable command and event plane. Zrunner owns queueing and
+Zboard is the durable command and event plane. Zrunner owns queueing and
 execution. The operating system owns enforcement through a systemd cgroup.
 There is initially one runner on `debian1`; the same protocol permits one runner
 per macOS or Windows build host later.
@@ -21,14 +21,14 @@ The Rust workspace contains three crates:
 - `zrunner-protocol`: versioned job, control, lifecycle, and output documents.
 - `zrunner-core`: priority scheduling, state replay, resource accounting,
   shared locks, and Linux pressure sampling.
-- `zrunner`: the daemon and CLI boundary, including AI Board JSONL transport,
+- `zrunner`: the daemon and CLI boundary, including Zboard JSONL transport,
   process ownership, output buffering, cancellation, and systemd packaging.
 
-## AI Board prerequisite
+## Zboard prerequisite
 
-Compiler output must not enter AI Board v1. Version 1 scans and decompresses
+Compiler output must not enter Zboard v1. Version 1 scans and decompresses
 every message before relevance filtering and retains the complete board in each
-process. AI Board v2 must first provide route-partitioned message storage,
+process. Zboard v2 must first provide route-partitioned message storage,
 bounded recent state, durable per-consumer checkpoints, expiring messages, and
 idempotent v1 migration.
 
@@ -59,27 +59,36 @@ replaying the complete historical board; history remains explicitly available.
 
 ## Job protocol
 
-Agents create and join `job-<lowercase-ulid>`, then send a job envelope as the
-message body in the `zrunner` group:
+Agents create and join `job-<lowercase-ulid>`, then send a concise human message
+with the job envelope in the Zboard message's structured `meta` field in the
+`zrunner` group:
 
 ```json
 {
-  "schema": "zrunner.job.v1",
-  "id": "01M1...",
-  "runner": "debian1",
-  "group": "job-01m1...",
-  "cwd": "/home/zcourts/projects/projects/worka/worka",
-  "argv": ["cargo", "test", "--locked", "--workspace"],
-  "env": {"RUST_BACKTRACE": "1"},
-  "priority": 0,
-  "profile": "rust",
-  "resources": {"compile_slots": "auto", "memory_mib": 4096},
-  "locks": ["cargo-target:debian1"],
-  "timeout_seconds": 3600,
-  "retry_on_runner_restart": 1,
-  "output_ttl_seconds": 86400
+  "op": "send",
+  "group": "zrunner",
+  "message": "Queue Worka workspace tests",
+  "meta": {
+    "schema": "zrunner.job.v1",
+    "id": "01M1...",
+    "runner": "debian1",
+    "group": "job-01m1...",
+    "cwd": "/home/zcourts/projects/projects/worka/worka",
+    "argv": ["cargo", "test", "--locked", "--workspace"],
+    "env": {"RUST_BACKTRACE": "1"},
+    "priority": 0,
+    "profile": "rust",
+    "resources": {"compile_slots": "auto", "memory_mib": 4096},
+    "locks": ["cargo-target:debian1"],
+    "timeout_seconds": 3600,
+    "retry_on_runner_restart": 1,
+    "output_ttl_seconds": 86400
+  }
 }
 ```
+
+The runner temporarily accepts the original JSON-string `message` form so
+already queued jobs survive the live upgrade. New producers use `meta`.
 
 `argv` is executed directly without an implicit shell. Environment values are
 durable board content and must not contain secrets. Interactive stdin is not
@@ -149,8 +158,12 @@ Linux runs `zrunner daemon` as a user service with `Restart=always`,
 `KillMode=control-group`, `MemoryHigh`, `MemoryMax`, `CPUQuota`, `TasksMax`, and
 an appropriate I/O weight. One host-local lock prevents duplicate daemons. On
 restart, zrunner requests durable `zrunner` history, rebuilds queued and
-terminal state, and resumes dispatch. A previously started nonterminal job is
-replayed, which is why submitted commands must tolerate at-least-once execution.
+terminal state, and resumes dispatch. Live protocol messages received during
+bootstrap remain buffered until that history has been applied, so a new arrival
+cannot jump ahead of older durable work. Replay restores queue and group state
+without emitting duplicate `accepted` or `queued` events. A previously started nonterminal job
+is replayed, which is why submitted commands must tolerate at-least-once
+execution.
 
 The daemon itself remains small. Build subprocesses are its direct descendants,
 so systemd removes them if ownership is lost. Cancellation sends SIGTERM to the
@@ -158,7 +171,7 @@ job process group and SIGKILL only after a bounded grace period.
 
 ## Rollout
 
-1. Ship and migrate AI Board v2 without deleting v1.
+1. Ship and migrate Zboard v2 without deleting v1.
 2. Qualify routing, checkpoints, expiry, and migration against a copy of the
    real board on Linux, macOS, and Windows.
 3. Run zrunner on Debian in observation mode, then accept checks and tests.

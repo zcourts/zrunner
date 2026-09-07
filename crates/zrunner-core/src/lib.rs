@@ -125,10 +125,12 @@ impl Scheduler {
         Ok(true)
     }
 
-    pub fn set_priority(&mut self, id: Ulid, priority: i32) -> Result<()> {
-        let job = self.jobs.get_mut(&id).context("unknown job")?;
+    pub fn set_priority(&mut self, id: Ulid, priority: i32) -> bool {
+        let Some(job) = self.jobs.get_mut(&id) else {
+            return false;
+        };
         if self.running.contains_key(&id) {
-            bail!("cannot reprioritize a running job");
+            return false;
         }
         self.queue.remove(&QueueKey {
             priority: job.priority,
@@ -136,7 +138,7 @@ impl Scheduler {
         });
         job.priority = priority;
         self.queue.insert(QueueKey { priority, id });
-        Ok(())
+        true
     }
 
     pub fn cancel_queued(&mut self, id: Ulid) -> Option<Job> {
@@ -253,11 +255,12 @@ mod tests {
     use super::*;
 
     fn job(priority: i32) -> Job {
+        let id = Ulid::new();
         Job {
             schema: JOB_SCHEMA.to_owned(),
-            id: Ulid::new(),
+            id,
             runner: "debian1".to_owned(),
-            group: "job-test".to_owned(),
+            group: format!("job-{}", id.to_string().to_ascii_lowercase()),
             cwd: "/tmp".to_owned(),
             argv: vec!["true".to_owned()],
             env: BTreeMap::new(),
@@ -287,5 +290,20 @@ mod tests {
         };
         let (selected, _) = scheduler.next(&Limits::default(), &host).unwrap().unwrap();
         assert_eq!(selected.id, high.id);
+    }
+
+    #[test]
+    fn reprioritizing_running_or_unknown_job_is_a_nonfatal_noop() {
+        let mut scheduler = Scheduler::default();
+        let running = job(0);
+        scheduler.enqueue(running.clone()).unwrap();
+        let host = HostCapacity {
+            available_memory_mib: 16_000,
+            ..HostCapacity::default()
+        };
+        scheduler.next(&Limits::default(), &host).unwrap().unwrap();
+
+        assert!(!scheduler.set_priority(running.id, 100));
+        assert!(!scheduler.set_priority(Ulid::new(), 100));
     }
 }
