@@ -469,7 +469,7 @@ impl Daemon {
                             return Ok(());
                         }
                     };
-                    if let Err(error) = validate_rust_target(&job, &project) {
+                    if let Err(error) = validate_rust_target(&job) {
                         self.publish_state(
                             &job,
                             JobState::Rejected,
@@ -930,11 +930,16 @@ fn validate_docker_build(job: &Job) -> Result<()> {
     Ok(())
 }
 
-fn validate_rust_target(job: &Job, project: &str) -> Result<()> {
+fn validate_rust_target(job: &Job) -> Result<()> {
     if !matches!(job.profile, JobProfile::Rust) {
         return Ok(());
     }
 
+    let project = Path::new(&job.cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .context("cwd must end with a UTF-8 project directory name")?;
     let expected_target = format!(
         "/home/zcourts/projects/projects/build/{}/{project}",
         job.runner
@@ -1171,23 +1176,31 @@ mod tests {
             output_ttl_seconds: 60,
         };
 
-        assert!(validate_rust_target(&job, "worka").is_err());
+        assert!(validate_rust_target(&job).is_err());
         job.env.insert(
             "CARGO_TARGET_DIR".to_owned(),
             "/home/zcourts/projects/projects/build/debian1/worka".to_owned(),
         );
-        assert!(validate_rust_target(&job, "worka").is_err());
+        assert!(validate_rust_target(&job).is_err());
         job.locks.push("cargo-target:debian1:worka".to_owned());
-        assert!(validate_rust_target(&job, "worka").is_ok());
+        assert!(validate_rust_target(&job).is_ok());
 
         job.locks.push("cargo-target:debian1".to_owned());
-        assert!(validate_rust_target(&job, "worka").is_err());
+        assert!(validate_rust_target(&job).is_err());
         job.locks.pop();
         job.env.insert(
             "CARGO_TARGET_DIR".to_owned(),
             "/home/zcourts/projects/projects/build/debian1".to_owned(),
         );
-        assert!(validate_rust_target(&job, "worka").is_err());
+        assert!(validate_rust_target(&job).is_err());
+    }
+
+    #[test]
+    fn rust_target_follows_the_working_repository_not_the_submitter() {
+        let job = example_job(PathBuf::from(
+            "/home/zcourts/projects/projects/worka/zrunner",
+        ));
+        assert!(validate_rust_target(&job).is_ok());
     }
 
     #[test]

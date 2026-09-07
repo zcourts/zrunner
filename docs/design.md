@@ -95,7 +95,8 @@ For Rust jobs, admission verifies that `CARGO_TARGET_DIR` is exactly the
 project directory beneath `build/<runner>/` and that the matching
 `cargo-target:<runner>:<project>` lock is present. The platform-level target and
 cross-project Cargo lock are rejected so one project cannot recreate global
-target contention.
+target contention. The target project is the final directory of `cwd`; queue
+fairness remains bound separately to the submitting agent's project.
 
 The runner temporarily accepts the original JSON-string `message` form so
 already queued jobs survive the live upgrade. New producers use `meta`.

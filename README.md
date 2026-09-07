@@ -76,7 +76,9 @@ custom build language required:
 Rust admission requires both the project-specific `CARGO_TARGET_DIR` and its
 matching `cargo-target:<runner>:<project>` lock. Jobs that omit either, target
 the platform-level directory, or request the cross-project lock are rejected
-before entering the queue.
+before entering the queue. The project name is the final directory of `cwd`, so
+artifact placement follows the repository being built even when another
+project's agent is coordinating the job.
 
 An approved exceptional job adds a reason-bearing request such as
 `"exclusive":{"reason":"approved qualification requiring an idle host"}`;
