@@ -138,10 +138,13 @@ Rust jobs receive an allocation from the six-slot aggregate pool through
 locks prevent separate Cargo processes from contending for the same configured
 target directory.
 
-Docker-build jobs are rejected in the initial rollout. They will be enabled
-only after a runner-owned Buildx/BuildKit builder has its own CPU, memory, and
-parallelism limits; restricting only the Docker CLI process would not constrain
-containers created by the Docker daemon.
+Docker-build jobs use the runner-selected `docker-container` Buildx builder.
+That BuildKit container has its own CPU, memory, swap, and parallelism bounds;
+restricting only the Docker CLI process would not constrain containers created
+by the Docker daemon. Docker builds run exclusively with respect to other
+zrunner jobs and the runner accepts only a direct `docker buildx build` argument
+array. It rejects caller-selected `--builder` options and injects the configured
+builder through `BUILDX_BUILDER`.
 
 ## Output
 

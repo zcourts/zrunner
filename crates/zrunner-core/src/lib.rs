@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use ulid::Ulid;
-use zrunner_protocol::{CompileSlots, Job};
+use zrunner_protocol::{CompileSlots, Job, JobProfile};
 
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -163,6 +163,16 @@ impl Scheduler {
         }
         let key = self.queue.first().cloned().expect("queue is not empty");
         let job = self.jobs.get(&key.id).expect("queue points to job");
+        let docker_is_running = self.running.keys().any(|id| {
+            self.jobs
+                .get(id)
+                .is_some_and(|job| matches!(job.profile, JobProfile::DockerBuild))
+        });
+        if (matches!(job.profile, JobProfile::DockerBuild) && !self.running.is_empty())
+            || docker_is_running
+        {
+            return Ok(None);
+        }
         let requested_memory = job.resources.memory_mib.max(512);
         if requested_memory > limits.max_job_memory_mib {
             bail!("job {} requests more memory than the host limit", job.id);
@@ -305,5 +315,36 @@ mod tests {
 
         assert!(!scheduler.set_priority(running.id, 100));
         assert!(!scheduler.set_priority(Ulid::new(), 100));
+    }
+
+    #[test]
+    fn docker_builds_run_exclusively() {
+        let mut scheduler = Scheduler::default();
+        let running = job(50);
+        let mut docker = job(100);
+        docker.profile = JobProfile::DockerBuild;
+        scheduler.enqueue(running.clone()).unwrap();
+        let host = HostCapacity {
+            available_memory_mib: 16_000,
+            ..HostCapacity::default()
+        };
+        scheduler.next(&Limits::default(), &host).unwrap().unwrap();
+        scheduler.enqueue(docker).unwrap();
+        assert!(scheduler.next(&Limits::default(), &host).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_running_docker_build_blocks_other_jobs() {
+        let mut scheduler = Scheduler::default();
+        let mut docker = job(100);
+        docker.profile = JobProfile::DockerBuild;
+        scheduler.enqueue(docker).unwrap();
+        let host = HostCapacity {
+            available_memory_mib: 16_000,
+            ..HostCapacity::default()
+        };
+        scheduler.next(&Limits::default(), &host).unwrap().unwrap();
+        scheduler.enqueue(job(50)).unwrap();
+        assert!(scheduler.next(&Limits::default(), &host).unwrap().is_none());
     }
 }

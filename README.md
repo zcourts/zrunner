@@ -13,6 +13,6 @@ The first implementation targets Linux and is supervised by `systemd --user`.
 See [the design](docs/design.md) for the protocol, resource model, and rollout
 sequence.
 
-Docker-build jobs deliberately remain disabled until a runner-owned bounded
-BuildKit worker is installed; Rust and generic noninteractive jobs are the
-initial supported profiles.
+Docker-build jobs use a runner-selected `docker-container` Buildx builder with
+its own CPU, memory, and BuildKit parallelism bounds. The runner admits these
+jobs exclusively and accepts only direct `docker buildx build` argument arrays.

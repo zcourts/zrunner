@@ -2,6 +2,7 @@
   "zboard": "/home/zcourts/projects/projects/releases/zboard/0.4.0/linux-aarch64/zboard",
   "board_root": "/home/zcourts/projects/projects/.ai/message-board",
   "runner": "debian1",
+  "docker_builder": "zrunner-debian1",
   "limits": {
     "max_running_jobs": 2,
     "max_compile_slots": 6,

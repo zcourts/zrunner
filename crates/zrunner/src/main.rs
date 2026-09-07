@@ -36,6 +36,8 @@ struct Config {
     #[serde(default = "default_runner")]
     runner: String,
     #[serde(default)]
+    docker_builder: Option<String>,
+    #[serde(default)]
     limits: ConfigLimits,
 }
 
@@ -384,7 +386,7 @@ impl Daemon {
     fn handle_protocol_value(&mut self, value: Value, announce: bool) -> Result<()> {
         match value.get("schema").and_then(Value::as_str) {
             Some(JOB_SCHEMA) => {
-                let job: Job = match serde_json::from_value(value) {
+                let mut job: Job = match serde_json::from_value(value) {
                     Ok(job) => job,
                     Err(error) => {
                         eprintln!("zrunner: reject malformed job: {error}");
@@ -393,14 +395,27 @@ impl Daemon {
                 };
                 if job.runner == self.config.runner && !self.terminal.contains(&job.id) {
                     if matches!(job.profile, JobProfile::DockerBuild) {
-                        self.publish_state(
-                            &job,
-                            JobState::Rejected,
-                            Some("docker-build jobs are disabled until the bounded runner-owned BuildKit builder is installed"),
-                            None,
-                        )?;
-                        self.terminal.insert(job.id);
-                        return Ok(());
+                        let Some(builder) = self.config.docker_builder.as_deref() else {
+                            self.publish_state(
+                                &job,
+                                JobState::Rejected,
+                                Some("docker-build jobs are disabled on this runner"),
+                                None,
+                            )?;
+                            self.terminal.insert(job.id);
+                            return Ok(());
+                        };
+                        if let Err(error) = validate_docker_build(&job) {
+                            self.publish_state(
+                                &job,
+                                JobState::Rejected,
+                                Some(&format!("invalid docker-build job: {error:#}")),
+                                None,
+                            )?;
+                            self.terminal.insert(job.id);
+                            return Ok(());
+                        }
+                        job.locks.push(format!("buildkit:{builder}"));
                     }
                     let inserted = match self.scheduler.enqueue(job.clone()) {
                         Ok(inserted) => inserted,
@@ -493,6 +508,14 @@ impl Daemon {
             .process_group(0);
         if matches!(job.profile, JobProfile::Rust) {
             command.env("CARGO_BUILD_JOBS", allocation.compile_slots.to_string());
+        } else if matches!(job.profile, JobProfile::DockerBuild) {
+            command.env(
+                "BUILDX_BUILDER",
+                self.config
+                    .docker_builder
+                    .as_deref()
+                    .context("docker builder is not configured")?,
+            );
         }
         let mut child = command
             .spawn()
@@ -750,6 +773,23 @@ fn validate_parallelism(job: &Job, allocation: u16) -> Result<()> {
     Ok(())
 }
 
+fn validate_docker_build(job: &Job) -> Result<()> {
+    if job.argv.first().map(String::as_str) != Some("docker")
+        || job.argv.get(1).map(String::as_str) != Some("buildx")
+        || job.argv.get(2).map(String::as_str) != Some("build")
+    {
+        bail!("argv must begin with docker buildx build");
+    }
+    if job
+        .argv
+        .iter()
+        .any(|argument| argument == "--builder" || argument.starts_with("--builder="))
+    {
+        bail!("the runner selects the bounded BuildKit builder");
+    }
+    Ok(())
+}
+
 fn signal_group(pid: u32, signal: i32) -> Result<()> {
     let result = unsafe { libc::kill(-(pid as i32), signal) };
     if result == 0 {
@@ -766,7 +806,10 @@ fn signal_group(pid: u32, signal: i32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use zrunner_protocol::ResourceRequest;
 
     #[test]
     fn structured_meta_is_the_protocol_payload() {
@@ -810,5 +853,34 @@ mod tests {
 
         assert_eq!(protocols[0]["id"], "old-job");
         assert_eq!(protocols[1]["id"], "new-job");
+    }
+
+    #[test]
+    fn docker_build_requires_the_runner_selected_buildx_builder() {
+        let id = Ulid::new();
+        let mut job = Job {
+            schema: JOB_SCHEMA.to_owned(),
+            id,
+            runner: "debian1".to_owned(),
+            group: format!("job-{}", id.to_string().to_ascii_lowercase()),
+            cwd: "/tmp".to_owned(),
+            argv: vec![
+                "docker".to_owned(),
+                "buildx".to_owned(),
+                "build".to_owned(),
+                ".".to_owned(),
+            ],
+            env: BTreeMap::new(),
+            priority: 0,
+            profile: JobProfile::DockerBuild,
+            resources: ResourceRequest::default(),
+            locks: Vec::new(),
+            timeout_seconds: 60,
+            retry_on_runner_restart: 0,
+            output_ttl_seconds: 60,
+        };
+        assert!(validate_docker_build(&job).is_ok());
+        job.argv.push("--builder=unbounded".to_owned());
+        assert!(validate_docker_build(&job).is_err());
     }
 }
