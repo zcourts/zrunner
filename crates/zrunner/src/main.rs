@@ -19,7 +19,7 @@ use ulid::Ulid;
 use zrunner_core::{Allocation, HostCapacity, Limits, Scheduler};
 use zrunner_protocol::{
     CONTROL_SCHEMA, Control, ControlAction, EVENT_SCHEMA, JOB_SCHEMA, Job, JobEvent, JobOutput,
-    JobProfile, JobState, OUTPUT_SCHEMA, OutputEncoding, OutputStream,
+    JobProfile, JobState, OUTPUT_SCHEMA, OutputEncoding, OutputStream, RustCodegenBackend,
 };
 
 const DEFAULT_ROOT: &str = "/home/zcourts/projects/projects/.ai/message-board";
@@ -215,6 +215,7 @@ fn example_job(cwd: PathBuf) -> Job {
         .collect(),
         priority: 0,
         profile: JobProfile::Rust,
+        rust_codegen_backend: None,
         resources: Default::default(),
         locks: vec![format!("cargo-target:{runner}:{project}")],
         exclusive: None,
@@ -479,6 +480,16 @@ impl Daemon {
                         self.terminal.insert(job.id);
                         return Ok(());
                     }
+                    if let Err(error) = validate_rust_codegen_request(&job) {
+                        self.publish_state(
+                            &job,
+                            JobState::Rejected,
+                            Some(&format!("invalid Rust codegen request: {error:#}")),
+                            None,
+                        )?;
+                        self.terminal.insert(job.id);
+                        return Ok(());
+                    }
                     let inserted = match self.scheduler.enqueue(job.clone(), project) {
                         Ok(inserted) => inserted,
                         Err(error) => {
@@ -565,13 +576,18 @@ impl Daemon {
         command
             .args(&job.argv[1..])
             .current_dir(&job.cwd)
-            .envs(&job.env)
+            .envs(
+                job.env
+                    .iter()
+                    .filter(|(key, _)| !is_cargo_codegen_environment(key)),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
-        if matches!(job.profile, JobProfile::Rust) {
+        let rust_codegen_backend = if matches!(job.profile, JobProfile::Rust) {
             command.env("CARGO_BUILD_JOBS", allocation.compile_slots.to_string());
+            Some(configure_rust_codegen(&mut command, &job))
         } else if matches!(job.profile, JobProfile::DockerBuild) {
             command.env(
                 "BUILDX_BUILDER",
@@ -580,7 +596,10 @@ impl Daemon {
                     .as_deref()
                     .context("docker builder is not configured")?,
             );
-        }
+            None
+        } else {
+            None
+        };
         let mut child = command
             .spawn()
             .with_context(|| format!("start job {}", job.id))?;
@@ -592,10 +611,14 @@ impl Daemon {
             &job,
             JobState::Started,
             Some(&format!(
-                "compile_slots={} memory_mib={} exclusive={}",
+                "compile_slots={} memory_mib={} exclusive={} rust_codegen_backend={}",
                 allocation.compile_slots,
                 allocation.memory_mib,
-                job.exclusive.is_some()
+                job.exclusive.is_some(),
+                rust_codegen_backend.map_or("n/a", |backend| match backend {
+                    RustCodegenBackend::Cranelift => "cranelift",
+                    RustCodegenBackend::Llvm => "llvm",
+                })
             )),
             None,
         )?;
@@ -913,6 +936,75 @@ fn validate_parallelism(job: &Job, allocation: u16) -> Result<()> {
     Ok(())
 }
 
+const CRANELIFT_ENVIRONMENT_KEYS: [&str; 3] = [
+    "CARGO_UNSTABLE_CODEGEN_BACKEND",
+    "CARGO_PROFILE_DEV_CODEGEN_BACKEND",
+    "CARGO_PROFILE_TEST_CODEGEN_BACKEND",
+];
+
+fn is_cargo_codegen_environment(key: &str) -> bool {
+    key == "CARGO_UNSTABLE_CODEGEN_BACKEND"
+        || (key.starts_with("CARGO_PROFILE_") && key.ends_with("_CODEGEN_BACKEND"))
+}
+
+fn validate_rust_codegen_request(job: &Job) -> Result<()> {
+    if !matches!(job.profile, JobProfile::Rust) {
+        return Ok(());
+    }
+    if job.argv.iter().any(|argument| {
+        argument
+            .strip_prefix("-Z")
+            .is_some_and(|value| value.starts_with("codegen-backend"))
+    }) || job
+        .argv
+        .windows(2)
+        .any(|arguments| arguments[0] == "-Z" && arguments[1].starts_with("codegen-backend"))
+    {
+        bail!("zrunner owns -Zcodegen-backend; use rust_codegen_backend instead");
+    }
+    Ok(())
+}
+
+fn configure_rust_codegen(command: &mut Command, job: &Job) -> RustCodegenBackend {
+    for key in CRANELIFT_ENVIRONMENT_KEYS {
+        command.env_remove(key);
+    }
+
+    let backend = resolved_rust_codegen_backend(job);
+    if backend == RustCodegenBackend::Cranelift {
+        command
+            .env("RUSTUP_TOOLCHAIN", "nightly")
+            .env("CARGO_UNSTABLE_CODEGEN_BACKEND", "true")
+            .env("CARGO_PROFILE_DEV_CODEGEN_BACKEND", "cranelift")
+            .env("CARGO_PROFILE_TEST_CODEGEN_BACKEND", "cranelift");
+    }
+    backend
+}
+
+fn resolved_rust_codegen_backend(job: &Job) -> RustCodegenBackend {
+    if rust_job_requires_llvm(job) {
+        RustCodegenBackend::Llvm
+    } else {
+        job.rust_codegen_backend
+            .unwrap_or(RustCodegenBackend::Cranelift)
+    }
+}
+
+fn rust_job_requires_llvm(job: &Job) -> bool {
+    job.argv.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--release" | "bench" | "install" | "package" | "publish"
+        ) || argument == "--target"
+            || argument.starts_with("--target=")
+            || argument
+                .strip_prefix("--profile=")
+                .is_some_and(|profile| !matches!(profile, "dev" | "test"))
+    }) || job.argv.windows(2).any(|arguments| {
+        arguments[0] == "--profile" && !matches!(arguments[1].as_str(), "dev" | "test")
+    }) || job.env.contains_key("CARGO_BUILD_TARGET")
+}
+
 fn validate_docker_build(job: &Job) -> Result<()> {
     if job.argv.first().map(String::as_str) != Some("docker")
         || job.argv.get(1).map(String::as_str) != Some("buildx")
@@ -1142,6 +1234,7 @@ mod tests {
             env: BTreeMap::new(),
             priority: 0,
             profile: JobProfile::DockerBuild,
+            rust_codegen_backend: None,
             resources: ResourceRequest::default(),
             locks: Vec::new(),
             exclusive: None,
@@ -1168,6 +1261,7 @@ mod tests {
             env: BTreeMap::new(),
             priority: 0,
             profile: JobProfile::Rust,
+            rust_codegen_backend: None,
             resources: ResourceRequest::default(),
             locks: Vec::new(),
             exclusive: None,
@@ -1204,6 +1298,116 @@ mod tests {
     }
 
     #[test]
+    fn rust_development_defaults_to_nightly_cranelift() {
+        let job = example_job(PathBuf::from(
+            "/home/zcourts/projects/projects/worka/zrunner",
+        ));
+        let mut command = Command::new("cargo");
+
+        assert_eq!(
+            configure_rust_codegen(&mut command, &job),
+            RustCodegenBackend::Cranelift
+        );
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get("RUSTUP_TOOLCHAIN"),
+            Some(&Some("nightly".to_owned()))
+        );
+        assert_eq!(
+            environment.get("CARGO_PROFILE_DEV_CODEGEN_BACKEND"),
+            Some(&Some("cranelift".to_owned()))
+        );
+        assert_eq!(
+            environment.get("CARGO_PROFILE_TEST_CODEGEN_BACKEND"),
+            Some(&Some("cranelift".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rust_codegen_can_opt_out_to_llvm() {
+        let mut job = example_job(PathBuf::from(
+            "/home/zcourts/projects/projects/worka/zrunner",
+        ));
+        job.rust_codegen_backend = Some(RustCodegenBackend::Llvm);
+        assert_eq!(
+            resolved_rust_codegen_backend(&job),
+            RustCodegenBackend::Llvm
+        );
+    }
+
+    #[test]
+    fn rust_jobs_cannot_override_the_runner_with_codegen_flags() {
+        for arguments in [
+            vec!["cargo", "test", "-Zcodegen-backend=llvm"],
+            vec!["cargo", "test", "-Z", "codegen-backend=llvm"],
+        ] {
+            let mut job = example_job(PathBuf::from(
+                "/home/zcourts/projects/projects/worka/zrunner",
+            ));
+            job.argv = arguments.into_iter().map(str::to_owned).collect();
+            assert!(validate_rust_codegen_request(&job).is_err());
+        }
+    }
+
+    #[test]
+    fn identifies_cargo_codegen_environment_overrides() {
+        assert!(is_cargo_codegen_environment(
+            "CARGO_UNSTABLE_CODEGEN_BACKEND"
+        ));
+        assert!(is_cargo_codegen_environment(
+            "CARGO_PROFILE_RELEASE_CODEGEN_BACKEND"
+        ));
+        assert!(!is_cargo_codegen_environment("CARGO_TARGET_DIR"));
+    }
+
+    #[test]
+    fn release_benchmark_package_and_cross_target_jobs_force_llvm() {
+        for arguments in [
+            vec!["cargo", "build", "--release"],
+            vec!["cargo", "bench"],
+            vec!["cargo", "package"],
+            vec!["cargo", "publish"],
+            vec!["cargo", "install"],
+            vec!["cargo", "build", "--profile", "production"],
+            vec!["cargo", "build", "--profile=release"],
+            vec!["cargo", "build", "--target", "x86_64-unknown-linux-gnu"],
+            vec!["cargo", "build", "--target=x86_64-unknown-linux-gnu"],
+        ] {
+            let mut job = example_job(PathBuf::from(
+                "/home/zcourts/projects/projects/worka/zrunner",
+            ));
+            job.argv = arguments.into_iter().map(str::to_owned).collect();
+            job.rust_codegen_backend = Some(RustCodegenBackend::Cranelift);
+            assert_eq!(
+                resolved_rust_codegen_backend(&job),
+                RustCodegenBackend::Llvm,
+                "arguments: {:?}",
+                job.argv
+            );
+        }
+
+        let mut job = example_job(PathBuf::from(
+            "/home/zcourts/projects/projects/worka/zrunner",
+        ));
+        job.env.insert(
+            "CARGO_BUILD_TARGET".to_owned(),
+            "wasm32-unknown-unknown".to_owned(),
+        );
+        assert_eq!(
+            resolved_rust_codegen_backend(&job),
+            RustCodegenBackend::Llvm
+        );
+    }
+
+    #[test]
     fn exclusivity_requires_an_allowed_project_profile_and_reason() {
         let id = Ulid::new();
         let mut job = Job {
@@ -1217,6 +1421,7 @@ mod tests {
             env: BTreeMap::new(),
             priority: 0,
             profile: JobProfile::DockerBuild,
+            rust_codegen_backend: None,
             resources: ResourceRequest::default(),
             locks: Vec::new(),
             exclusive: Some(zrunner_protocol::ExclusivityRequest {
@@ -1253,6 +1458,7 @@ mod tests {
             env: BTreeMap::new(),
             priority: 0,
             profile: JobProfile::Generic,
+            rust_codegen_backend: None,
             resources: ResourceRequest::default(),
             locks: Vec::new(),
             exclusive: None,

@@ -317,6 +317,7 @@ mod tests {
             env: BTreeMap::new(),
             priority,
             profile: JobProfile::Generic,
+            rust_codegen_backend: None,
             resources: ResourceRequest {
                 compile_slots: CompileSlots::Exact(1),
                 memory_mib: 512,

@@ -18,6 +18,13 @@ pub enum JobProfile {
     IoHeavy,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RustCodegenBackend {
+    Cranelift,
+    Llvm,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum CompileSlots {
@@ -59,6 +66,8 @@ pub struct Job {
     #[serde(default)]
     pub priority: i32,
     pub profile: JobProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_codegen_backend: Option<RustCodegenBackend>,
     #[serde(default)]
     pub resources: ResourceRequest,
     #[serde(default)]
@@ -102,6 +111,9 @@ impl Job {
         }
         if self.locks.iter().any(String::is_empty) {
             return Err("locks must not be empty");
+        }
+        if self.rust_codegen_backend.is_some() && !matches!(self.profile, JobProfile::Rust) {
+            return Err("rust_codegen_backend requires the rust profile");
         }
         if self
             .exclusive
@@ -218,6 +230,7 @@ mod tests {
             env: BTreeMap::new(),
             priority: 0,
             profile: JobProfile::Rust,
+            rust_codegen_backend: None,
             resources: ResourceRequest::default(),
             locks: Vec::new(),
             exclusive: None,
@@ -241,6 +254,7 @@ mod tests {
             env: BTreeMap::new(),
             priority: 0,
             profile: JobProfile::Generic,
+            rust_codegen_backend: None,
             resources: ResourceRequest::default(),
             locks: Vec::new(),
             exclusive: None,
@@ -255,5 +269,33 @@ mod tests {
         );
         job.group = expected;
         assert_eq!(job.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rust_codegen_override_requires_the_rust_profile() {
+        let id = Ulid::new();
+        let job = Job {
+            schema: JOB_SCHEMA.to_owned(),
+            id,
+            runner: "debian1".to_owned(),
+            group: format!("job-{}", id.to_string().to_ascii_lowercase()),
+            project: None,
+            cwd: "/tmp".to_owned(),
+            argv: vec!["true".to_owned()],
+            env: BTreeMap::new(),
+            priority: 0,
+            profile: JobProfile::Generic,
+            rust_codegen_backend: Some(RustCodegenBackend::Llvm),
+            resources: ResourceRequest::default(),
+            locks: Vec::new(),
+            exclusive: None,
+            timeout_seconds: 1,
+            retry_on_runner_restart: 0,
+            output_ttl_seconds: 1,
+        };
+        assert_eq!(
+            job.validate(),
+            Err("rust_codegen_backend requires the rust profile")
+        );
     }
 }

@@ -98,6 +98,17 @@ cross-project Cargo lock are rejected so one project cannot recreate global
 target contention. The target project is the final directory of `cwd`; queue
 fairness remains bound separately to the submitting agent's project.
 
+The Rust profile defaults development, check, and test work to nightly
+Cranelift. The runner supplies `RUSTUP_TOOLCHAIN=nightly`, enables Cargo's
+unstable codegen-backend setting, and selects Cranelift for the `dev` and `test`
+profiles. A job can opt out with `"rust_codegen_backend":"llvm"`. Direct Cargo
+release, benchmark, package, publish, install, and cross-target argument shapes
+always resolve to LLVM; wrapper scripts must use the explicit LLVM override when
+their production or qualification purpose is not visible in `argv`. The runner
+filters Cargo backend environment variables and rejects direct
+`-Zcodegen-backend` flags so this protocol field remains the single policy
+authority.
+
 The runner temporarily accepts the original JSON-string `message` form so
 already queued jobs survive the live upgrade. New producers use `meta`.
 

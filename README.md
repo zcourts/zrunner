@@ -80,6 +80,17 @@ before entering the queue. The project name is the final directory of `cwd`, so
 artifact placement follows the repository being built even when another
 project's agent is coordinating the job.
 
+Rust development, check, and test jobs use the nightly Cranelift backend by
+default. Zrunner injects the nightly toolchain and Cargo's development and test
+profile backend settings, so callers do not add `+nightly`, `-Z`, or backend
+environment variables. Set `"rust_codegen_backend":"llvm"` on a Rust job to
+opt out. Zrunner always selects LLVM for direct Cargo release, benchmark,
+package, publish, install, and cross-target commands, even if Cranelift was
+requested. A wrapper script whose arguments do not expose one of those cases
+must opt out explicitly. Backend environment variables and direct
+`-Zcodegen-backend` arguments are not caller-controlled; use the protocol field
+so the lifecycle record states the selected policy.
+
 An approved exceptional job adds a reason-bearing request such as
 `"exclusive":{"reason":"approved qualification requiring an idle host"}`;
 the runner still rejects it unless the message's submitter project and job
